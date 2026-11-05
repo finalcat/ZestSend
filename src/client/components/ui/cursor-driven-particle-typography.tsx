@@ -64,7 +64,9 @@ class Particle {
         // Physics interaction with mouse
         const interactionRadius = 120; // 120px interaction radius
 
-        if (distance < interactionRadius && mouseX !== -1000 && mouseY !== -1000) {
+        // distance > 0.5 also guards the divide below: a NaN particle would
+        // never pass the velocity settle check and would keep the rAF alive.
+        if (distance > 0.5 && distance < interactionRadius && mouseX !== -1000 && mouseY !== -1000) {
             const forceDirectionX = dx / distance;
             const forceDirectionY = dy / distance;
 
@@ -85,15 +87,6 @@ class Particle {
         // Friction
         this.vx *= 0.85;
         this.vy *= 0.85;
-
-        // Add subtle noise/jitter when close to origin
-        const distToOrigin = Math.sqrt(
-            Math.pow(this.x - this.originX, 2) + Math.pow(this.y - this.originY, 2)
-        );
-        if (distToOrigin < 1 && Math.random() > 0.95) {
-            this.vx += (Math.random() - 0.5) * 0.2;
-            this.vy += (Math.random() - 0.5) * 0.2;
-        }
 
         this.x += this.vx;
         this.y += this.vy;
@@ -135,6 +128,13 @@ export function CursorDrivenParticleTypography({
 
         let containerWidth = 0;
         let containerHeight = 0;
+
+        // Idle budget: the loop pauses once every particle has come to rest
+        // near its origin; pointer activity wakes it up again.
+        const SETTLE_SPEED_PX = 0.05;
+        const SETTLE_FRAMES = 30; // ~0.5 s of consecutive settled frames at 60 Hz
+        let running = false;
+        let settledFrames = 0;
 
         const init = () => {
             const container = containerRef.current;
@@ -194,6 +194,11 @@ export function CursorDrivenParticleTypography({
                     }
                 }
             }
+
+            // Fresh particles start scattered — always re-arm the loop so a
+            // re-init while paused repaints and settles again.
+            settledFrames = 0;
+            wake();
         };
 
         const animate = () => {
@@ -203,10 +208,36 @@ export function CursorDrivenParticleTypography({
                 particle.update(mouseX, mouseY);
                 particle.draw(ctx);
             });
+
+            // Velocity-only settle check: a particle pinned off-origin by a
+            // stationary cursor reaches force equilibrium with v→0 (static
+            // picture), and an oscillating particle's speed never stays near
+            // zero for 30 consecutive frames — so this pauses exactly when
+            // motion is visually gone, parked cursor included.
+            const settled = particles.every(
+                (particle) =>
+                    Math.abs(particle.vx) + Math.abs(particle.vy) < SETTLE_SPEED_PX
+            );
+
+            settledFrames = settled ? settledFrames + 1 : 0;
+
+            if (settledFrames >= SETTLE_FRAMES) {
+                running = false; // 2D canvas keeps the last drawn frame
+                return;
+            }
+
+            animationFrameId = requestAnimationFrame(animate);
+        };
+
+        const wake = () => {
+            if (running) return;
+            running = true;
+            settledFrames = 0;
             animationFrameId = requestAnimationFrame(animate);
         };
 
         const handleMouseMove = (e: MouseEvent) => {
+            wake();
             const rect = canvas.getBoundingClientRect();
             mouseX = e.clientX - rect.left;
             mouseY = e.clientY - rect.top;
@@ -223,8 +254,7 @@ export function CursorDrivenParticleTypography({
 
         // Initialize with a short delay to ensure fonts/layout are ready
         const timeoutId = setTimeout(() => {
-            init();
-            animate();
+            init(); // init() starts the loop via wake()
         }, 100);
 
         const resizeObserver = new ResizeObserver(() => {
@@ -244,21 +274,29 @@ export function CursorDrivenParticleTypography({
             attributeFilter: ["class"]
         });
 
+        const handleTouchStart = (e: TouchEvent) => {
+            wake();
+            if (!e.touches[0]) return;
+            const rect = canvas.getBoundingClientRect();
+            mouseX = e.touches[0].clientX - rect.left;
+            mouseY = e.touches[0].clientY - rect.top;
+        };
+
+        const handleTouchMove = (e: TouchEvent) => {
+            wake();
+            if (!e.touches[0]) return;
+            const rect = canvas.getBoundingClientRect();
+            mouseX = e.touches[0].clientX - rect.left;
+            mouseY = e.touches[0].clientY - rect.top;
+        };
+
+        const handleTouchEnd = handleMouseLeave;
+
         canvas.addEventListener("mousemove", handleMouseMove);
         canvas.addEventListener("mouseleave", handleMouseLeave);
-        canvas.addEventListener("touchstart", (e) => {
-            if (!e.touches[0]) return;
-            const rect = canvas.getBoundingClientRect();
-            mouseX = e.touches[0].clientX - rect.left;
-            mouseY = e.touches[0].clientY - rect.top;
-        });
-        canvas.addEventListener("touchmove", (e) => {
-            if (!e.touches[0]) return;
-            const rect = canvas.getBoundingClientRect();
-            mouseX = e.touches[0].clientX - rect.left;
-            mouseY = e.touches[0].clientY - rect.top;
-        });
-        canvas.addEventListener("touchend", handleMouseLeave);
+        canvas.addEventListener("touchstart", handleTouchStart, { passive: true });
+        canvas.addEventListener("touchmove", handleTouchMove, { passive: true });
+        canvas.addEventListener("touchend", handleTouchEnd);
 
         return () => {
             clearTimeout(timeoutId);
@@ -266,6 +304,9 @@ export function CursorDrivenParticleTypography({
             themeObserver.disconnect();
             canvas.removeEventListener("mousemove", handleMouseMove);
             canvas.removeEventListener("mouseleave", handleMouseLeave);
+            canvas.removeEventListener("touchstart", handleTouchStart);
+            canvas.removeEventListener("touchmove", handleTouchMove);
+            canvas.removeEventListener("touchend", handleTouchEnd);
             cancelAnimationFrame(animationFrameId);
         };
     }, [text, fontSize, fontFamily, particleSize, particleDensity, dispersionStrength, returnSpeed, color]);

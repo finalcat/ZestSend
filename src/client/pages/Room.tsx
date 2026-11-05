@@ -630,11 +630,14 @@ function useTransferRates(transferred?: { received: number; sent: number }) {
         sent: latestRef.current?.sent ?? 0,
       };
       const previous = previousRef.current ?? current;
-      setRates({
+      const next = {
         received: Math.max(0, current.received - previous.received),
         sent: Math.max(0, current.sent - previous.sent),
-      });
+      };
       previousRef.current = current;
+      // Returning the identical reference lets React skip the re-render when
+      // idle rates are unchanged (e.g. both zero for hours).
+      setRates((prev) => (prev.received === next.received && prev.sent === next.sent ? prev : next));
     }, 1_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -1054,7 +1057,12 @@ function AudioSpectrum({
         context.fillRect(x, y, barWidth, barHeight);
       }
 
-      frame = window.requestAnimationFrame(draw);
+      // Idle budget: keep animating only while there is something to show.
+      // Inactive renders one zeroed frame (min-height bars) and stops; the
+      // effect re-runs whenever `active` flips, restarting as needed.
+      if (active) {
+        frame = window.requestAnimationFrame(draw);
+      }
     };
 
     draw();
@@ -3983,6 +3991,16 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   useEffect(() => {
     const timer = window.setInterval(() => {
       const timeoutAt = Date.now() - 12_000;
+      // Mirror of the flip condition below (`<=` here, keep `>` there):
+      // bail out before setState when no message is stale, so an idle room
+      // stops re-rendering once per second.
+      const hasStaleMessage = chatMessagesRef.current.some(
+        (message) =>
+          message.sender === "local" &&
+          message.deliveryStatus === "sending" &&
+          (message.lastAttemptedAt ?? message.sentAt) <= timeoutAt,
+      );
+      if (!hasStaleMessage) return;
       updateChatMessages((current) => current.map((message) => {
         if (message.sender !== "local" || message.deliveryStatus !== "sending" || (message.lastAttemptedAt ?? message.sentAt) > timeoutAt) return message;
         return { ...message, deliveryStatus: "error" };

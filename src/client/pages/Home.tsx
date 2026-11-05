@@ -253,6 +253,7 @@ function ActivityTransition({ activities }: { activities: readonly Activity[] })
     if (activities.length < 2) return;
 
     const timer = window.setInterval(() => {
+      if (document.hidden) return; // skip ticks while the tab is in the background
       setActivityIndex((index) => (index + 1) % activities.length);
     }, 2_400);
 

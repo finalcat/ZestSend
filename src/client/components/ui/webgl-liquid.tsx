@@ -297,6 +297,12 @@ export function WebGLLiquid({
         return;
       }
 
+      // Ambient animation budget: let the intro (reveal) play, then freeze on
+      // the last frame. The compositor keeps presenting it; the loop stops.
+      let frozen = false;
+      let frozenElapsedSec = 0;
+      let frozenRevealProgress = 1;
+
       const resize = () => {
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
         const { width, height } = host.getBoundingClientRect();
@@ -304,6 +310,9 @@ export function WebGLLiquid({
         canvas.height = Math.max(1, Math.floor(height * dpr));
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.uniform2f(uRes, canvas.width, canvas.height);
+        // Reallocating the drawing buffer clears it — repaint the frozen frame
+        // (deterministic: u_time is pinned) so the backdrop never blanks.
+        if (frozen) drawFrame(frozenElapsedSec, frozenRevealProgress);
       };
 
       resize();
@@ -313,11 +322,15 @@ export function WebGLLiquid({
       let rafId = 0;
       const start = performance.now();
 
-      const render = (now: number) => {
-        const elapsedSec = Math.max(0, (now - start - settings.delayMs) / 1000);
-        const revealProgress = settings.reveal
-          ? Math.min(1, elapsedSec / Math.max(settings.revealDuration, 0.05))
-          : 1;
+      // Ambient animation budget: let the intro (reveal) play, then freeze on
+      // the last frame. The compositor keeps presenting it; the loop stops.
+      const graceMs = 1_500;
+      const freezeAfterMs =
+        settings.delayMs + (settings.reveal ? settings.revealDuration * 1_000 : 0) + graceMs;
+
+      const drawFrame = (elapsedSec: number, revealProgress: number) => {
+        frozenElapsedSec = elapsedSec;
+        frozenRevealProgress = revealProgress;
 
         const deep = hexToRgb01(settings.colorDeep);
         const mid = hexToRgb01(settings.colorMid);
@@ -337,6 +350,21 @@ export function WebGLLiquid({
         gl.uniform1f(uOpacity, settings.opacity);
         gl.uniform1f(uReveal, revealProgress);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      };
+
+      const render = (now: number) => {
+        const elapsedMs = now - start;
+        const elapsedSec = Math.max(0, (elapsedMs - settings.delayMs) / 1000);
+        const revealProgress = settings.reveal
+          ? Math.min(1, elapsedSec / Math.max(settings.revealDuration, 0.05))
+          : 1;
+
+        drawFrame(elapsedSec, revealProgress);
+
+        if (elapsedMs >= freezeAfterMs) {
+          frozen = true;
+          return;
+        }
 
         rafId = requestAnimationFrame(render);
       };
