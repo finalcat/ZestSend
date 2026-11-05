@@ -3562,6 +3562,17 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     peerEverConnectedRef.current = false;
     setPeerPresence("solo");
     setChatSeatAdmitted(false);
+    // Route a phase change through the blocking dialog's exit state. Its
+    // framer-motion exit animation is rAF-driven and NEVER completes in a
+    // hidden/background tab, so onExitComplete alone would strand the room on
+    // a blank screen; the timer (throttled but not frozen in background tabs)
+    // forces the resolved phase after a grace wait.
+    const transitionViaDialogExit = (closingPhase: "closing-for-full" | "closing-for-ready", resolvedPhase: "full" | "ready") => {
+      setDialogPhase(closingPhase);
+      window.setTimeout(() => {
+        setDialogPhase((current) => current === closingPhase ? resolvedPhase : current);
+      }, 450);
+    };
     const showReconnectDialog = (detail = "Reconnecting signaling socket") => {
       setError(detail);
       setDialogPhase((current) => current === "ready" ? "closing-for-reconnect" : current === "closing-for-reconnect" ? current : "connecting");
@@ -3598,14 +3609,16 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         // stranding the room on a blank screen. "closing-for-reconnect" means
         // the workspace is showing with a pending modal timer; settle on
         // "ready" to cancel it.
-        setDialogPhase((current) => current === "connecting" ? "closing-for-ready" : current === "closing-for-reconnect" ? "ready" : current);
+        if (dialogPhaseRef.current === "connecting") transitionViaDialogExit("closing-for-ready", "ready");
+        else setDialogPhase((current) => current === "closing-for-reconnect" ? "ready" : current);
       },
       setError,
       () => {
         session.close();
         // From the blocking dialog let its exit animation run; from the
         // workspace (dialog never opened) jump straight to the full screen.
-        setDialogPhase((current) => current === "connecting" ? "closing-for-full" : "full");
+        if (dialogPhaseRef.current === "connecting") transitionViaDialogExit("closing-for-full", "full");
+        else setDialogPhase("full");
       },
       () => {
         // Stay in the workspace: the presence banner and corner status card
@@ -3661,11 +3674,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           } else {
             setConnectionNotice(null);
           }
-          setDialogPhase((current) => current === "connecting"
-            ? "closing-for-ready"
-            : current === "closing-for-reconnect"
-              ? "ready"
-              : current);
+          if (dialogPhaseRef.current === "connecting") transitionViaDialogExit("closing-for-ready", "ready");
+          else setDialogPhase((current) => current === "closing-for-reconnect" ? "ready" : current);
           return;
         }
         setConnectionNotice(null);
@@ -3689,11 +3699,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           && status.seatState === "confirmed" && status.p2pState === "waiting") {
           // Seat admitted and nobody else in the room: make sure the workspace
           // is showing (e.g. returning from the reconnect dialog).
-          setDialogPhase((current) => current === "connecting"
-            ? "closing-for-ready"
-            : current === "closing-for-reconnect"
-              ? "ready"
-              : current);
+          if (dialogPhaseRef.current === "connecting") transitionViaDialogExit("closing-for-ready", "ready");
+          else setDialogPhase((current) => current === "closing-for-reconnect" ? "ready" : current);
         }
       },
       () => {
