@@ -113,6 +113,7 @@ const workspaceComposerClassName = "relative h-28 shrink-0";
 function WorkspaceShell({
   children,
   footer,
+  reverse = false,
   status,
   onDragEnter,
   onDragLeave,
@@ -123,6 +124,7 @@ function WorkspaceShell({
 }: {
   children: ReactNode;
   footer: ReactNode;
+  reverse?: boolean;
   status?: ReactNode;
   onDragEnter?: DragEventHandler<HTMLElement>;
   onDragLeave?: DragEventHandler<HTMLElement>;
@@ -139,7 +141,7 @@ function WorkspaceShell({
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
-      <OverlayScrollbar className={workspaceScrollClassName} syncKey={scrollKey}>
+      <OverlayScrollbar className={workspaceScrollClassName} reverse={reverse} syncKey={scrollKey}>
         {children}
       </OverlayScrollbar>
       <form className="relative shrink-0 border-t border-white/10 pt-4" onSubmit={(event) => {
@@ -253,6 +255,7 @@ const workspaceCopy = {
     background: "Running in background",
     chatPlaceholder: "Write a message",
     chatEmpty: "Send a message to begin your private conversation",
+    chatLoadMore: (count: number) => (count === 1 ? "Load 1 earlier message" : `Load ${count} earlier messages`),
     exit: "Exit room",
     exitCancel: "Stay in room",
     exitConfirm: "Exit room",
@@ -276,6 +279,7 @@ const workspaceCopy = {
     background: "正在后台运行",
     chatPlaceholder: "输入消息",
     chatEmpty: "发送一条消息，开始私密对话",
+    chatLoadMore: (count: number) => `加载更早的 ${count} 条消息`,
     exit: "退出房间",
     exitCancel: "留在房间",
     exitConfirm: "退出房间",
@@ -791,9 +795,16 @@ function StatusMetric({ icon: Icon, label, locale, realtimeConnection = false, s
   );
 }
 
+// Cap the rendered chat history: every message carries framer-motion layout
+// measurement, so an unbounded list makes each layout pass O(n). Only the
+// newest slice is mounted; older entries expand on demand.
+const CHAT_RENDER_LIMIT = 50;
+const CHAT_RENDER_STEP = 50;
+
 function ChatWorkspace({
   accent,
   emptyMessage,
+  loadMoreLabel,
   messages,
   onMarkRead,
   onSend,
@@ -805,6 +816,7 @@ function ChatWorkspace({
 }: {
   accent: string;
   emptyMessage: string;
+  loadMoreLabel: (count: number) => string;
   messages: ChatMessage[];
   onMarkRead: (id: string) => boolean;
   onSend: (text: string) => boolean;
@@ -815,16 +827,16 @@ function ChatWorkspace({
   typingLabel: string;
 }) {
   const [draft, setDraft] = useState("");
+  const [visibleCount, setVisibleCount] = useState(CHAT_RENDER_LIMIT);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const readMessageIdsRef = useRef(new Set<string>());
   const hasFocusedComposerRef = useRef(false);
   const canSend = ready && draft.trim().length > 0;
 
-  useEffect(() => {
-    const viewport = messageListRef.current?.closest("[data-overlayscrollbars-viewport]");
-    if (viewport instanceof HTMLElement) viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
-  }, [messages.length]);
+  // The message list renders bottom-up inside a column-reverse scroller:
+  // scrollTop 0 is the newest message, so the browser pins to the bottom
+  // natively and never yanks a user who scrolled up — no JS scrolling.
 
   useEffect(() => {
     if (!ready || hasFocusedComposerRef.current) return;
@@ -854,6 +866,12 @@ function ChatWorkspace({
     setDraft("");
     window.requestAnimationFrame(() => composerRef.current?.focus());
   };
+
+  const hiddenCount = Math.max(0, messages.length - visibleCount);
+  // slice() copies before reverse(): messages (sorted ascending) is never
+  // mutated; the newest entry becomes the first DOM child, i.e. the bottom
+  // of the column-reverse list.
+  const visibleMessages = messages.slice(hiddenCount).reverse();
 
   return (
     <WorkspaceShell
@@ -902,13 +920,14 @@ function ChatWorkspace({
         </AutoTransition>
       )}
       onSubmit={send}
-      scrollKey={messages.length}
+      reverse
+      scrollKey={`${messages.length}:${visibleCount}`}
     >
-        <div ref={messageListRef} className={`flex min-h-full flex-col ${messages.length === 0 ? "" : "justify-end pt-8"}`}>
+        <div ref={messageListRef} className={`flex min-h-full w-full shrink-0 flex-col-reverse justify-end ${messages.length === 0 ? "" : "pt-8"}`}>
           <AnimatePresence initial={false} mode="popLayout">
             {messages.length === 0 ? (
               <WorkspaceEmptyState icon={<RiChat3Line aria-hidden="true" className="size-10 text-sky-200/55" />} key="empty-chat" message={emptyMessage} />
-            ) : messages.map((message) => {
+            ) : visibleMessages.map((message) => {
                 const isLocal = message.sender === "local";
                 return (
                   <motion.div key={message.id} layout="position" transition={{ duration: 0.2, ease: "easeOut" }}>
@@ -950,6 +969,15 @@ function ChatWorkspace({
                 );
               })}
           </AnimatePresence>
+          {hiddenCount > 0 ? (
+            <button
+              className="mb-5 w-full rounded-xl py-2 text-xs font-semibold tracking-[0.04em] text-sky-200/70 transition-colors hover:text-sky-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/70"
+              onClick={() => setVisibleCount((count) => count + CHAT_RENDER_STEP)}
+              type="button"
+            >
+              {loadMoreLabel(hiddenCount)}
+            </button>
+          ) : null}
         </div>
     </WorkspaceShell>
   );
@@ -2616,6 +2644,7 @@ function RoomWorkspace({
                       <ChatWorkspace
                         accent={theme.accent}
                         emptyMessage={workspace.chatEmpty}
+                        loadMoreLabel={workspace.chatLoadMore}
                         messages={chatMessages}
                         onMarkRead={onMarkChatMessageRead}
                         onSend={onSendChatMessage}

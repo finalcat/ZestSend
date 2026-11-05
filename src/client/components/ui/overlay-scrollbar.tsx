@@ -37,6 +37,14 @@ export function prepareNativeScrollbarHost(host: HTMLElement): boolean {
 
 type OverlayScrollbarProps = ComponentPropsWithoutRef<"div"> & {
   options?: PartialOptions;
+  /**
+   * Lays the scroll content out bottom-up (chat-style): the scroller anchors
+   * at the newest entry and grows upward, so scrollTop 0 means "at the
+   * bottom" natively. Applied to both host and viewport because either can
+   * be the real scrolling element (OverlayScrollbars mode vs the
+   * Apple/Safari native-scrollbar fallback).
+   */
+  reverse?: boolean;
   syncKey?: string | number | boolean | null;
 };
 
@@ -44,6 +52,7 @@ export function OverlayScrollbar({
   children,
   className,
   options = VERTICAL_SCROLLBAR_OPTIONS,
+  reverse = false,
   syncKey,
   ...props
 }: OverlayScrollbarProps) {
@@ -82,10 +91,10 @@ export function OverlayScrollbar({
     <div
       {...props}
       ref={hostRef}
-      className={cn("overflow-y-auto", className)}
+      className={cn("overflow-y-auto", reverse && "flex flex-col-reverse", className)}
       data-overlayscrollbars-initialize=""
     >
-      <div className="h-full min-h-full" ref={viewportRef}>
+      <div className={cn("h-full min-h-full", reverse && "flex shrink-0 flex-col-reverse")} ref={viewportRef}>
         {children}
       </div>
     </div>
