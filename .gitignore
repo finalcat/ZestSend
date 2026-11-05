@@ -35,3 +35,4 @@ pnpm-lock.yaml
 *.log
 backup/
 settings.json
+e2e-interruption-diagnostics.json

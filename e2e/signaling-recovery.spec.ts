@@ -83,6 +83,18 @@ async function openChat(page: Page) {
   return composer;
 }
 
+async function dumpTransportLogs(pages: { name: string; page: Page }[]) {
+  const result: Record<string, unknown> = {};
+  for (const { name, page } of pages) {
+    result[name] = {
+      page: await page.evaluate(() => (window as unknown as { __pagevlog?: unknown[] }).__pagevlog ?? null).catch(() => "page-gone"),
+      pc: await page.evaluate(() => (window as unknown as { __pclog?: unknown[] }).__pclog ?? null).catch(() => "page-gone"),
+      ws: await page.evaluate(() => (window as unknown as { __wslog?: unknown[] }).__wslog ?? null).catch(() => "page-gone"),
+    };
+  }
+  return result;
+}
+
 async function sendChat(page: Page, text: string) {
   const composer = await openChat(page);
   await composer.fill(text);
@@ -112,6 +124,38 @@ function observeFrames(page: Page, frames: string[]) {
 async function createRoomPeer(page: Page, roomId: string, interceptSignaling = true) {
   let blockNewSockets = false;
   let routeRegistered = false;
+  await page.addInitScript(() => {
+    const OrigWS = window.WebSocket;
+    (window as unknown as { __wslog: unknown[] }).__wslog = [];
+    class LoggedWS extends OrigWS {
+      constructor(...args: [string | URL, string | string[] | undefined]) {
+        super(args[0] as string, args[1] as string[]);
+        const url = String(args[0]);
+        const log = (window as unknown as { __wslog: { ev: string; t: number; url: string; code?: number; reason?: string }[] }).__wslog;
+        log.push({ ev: "construct", t: Date.now(), url: url.slice(-24) });
+        this.addEventListener("open", () => log.push({ ev: "open", t: Date.now(), url: url.slice(-24) }));
+        this.addEventListener("close", (event) => log.push({ ev: "close", t: Date.now(), url: url.slice(-24), code: (event as CloseEvent).code, reason: (event as CloseEvent).reason }));
+      }
+    }
+    window.WebSocket = LoggedWS;
+    const pagevlog: { ev: string; t: number }[] = [];
+    (window as unknown as { __pagevlog: { ev: string; t: number }[] }).__pagevlog = pagevlog;
+    window.addEventListener("pagehide", (event) => pagevlog.push({ ev: `pagehide(persisted=${(event as PageTransitionEvent).persisted})`, t: Date.now() }));
+    window.addEventListener("pageshow", (event) => pagevlog.push({ ev: `pageshow(persisted=${(event as PageTransitionEvent).persisted})`, t: Date.now() }));
+    document.addEventListener("visibilitychange", () => pagevlog.push({ ev: `visibility=${document.visibilityState}`, t: Date.now() }));
+    const OrigPC = window.RTCPeerConnection;
+    (window as unknown as { __pclog: unknown[] }).__pclog = [];
+    class LoggedPC extends OrigPC {
+      constructor(...args: ConstructorParameters<typeof RTCPeerConnection>) {
+        super(...args);
+        const id = (window as unknown as { __pclog: { id: number; ev: string; t: number }[] }).__pclog.length;
+        const log = (window as unknown as { __pclog: { id: number; ev: string; t: number }[] }).__pclog;
+        log.push({ id, ev: "construct", t: Date.now() });
+        this.addEventListener("connectionstatechange", () => log.push({ id, ev: this.connectionState, t: Date.now() }));
+      }
+    }
+    window.RTCPeerConnection = LoggedPC;
+  });
   const registerSignalingRoute = async () => {
     if (routeRegistered) return;
     await page.routeWebSocket(/\/api\/rooms\/\d{4}\/ws(?:\?.*)?$/, (client) => {
@@ -167,23 +211,49 @@ async function createPair(
   observeFrames(alice, aliceFrames);
   observeFrames(bob, bobFrames);
   await Promise.all([installPeerProbe(alice), installPeerProbe(bob)]);
-  const bobSession = await createRoomPeer(bob, roomId, interceptSignaling);
-  const aliceSession = await createRoomPeer(alice, roomId, interceptSignaling);
-  await openChat(alice);
-  await openChat(bob);
-  await expect(alice.getByRole("textbox", { name: "Write a message" })).toBeEnabled();
-  await expect(bob.getByRole("textbox", { name: "Write a message" })).toBeEnabled();
-  await expect.poll(() => peerCount(alice)).toBeGreaterThan(0);
-  await expect.poll(() => peerCount(bob)).toBeGreaterThan(0);
-  return { alice, aliceContext, aliceFrames, aliceSession, bob, bobContext, bobFrames, bobSession };
+  try {
+    const bobSession = await createRoomPeer(bob, roomId, interceptSignaling);
+    const aliceSession = await createRoomPeer(alice, roomId, interceptSignaling);
+    await openChat(alice);
+    await openChat(bob);
+    await expect(alice.getByRole("textbox", { name: "Write a message" })).toBeEnabled();
+    await expect(bob.getByRole("textbox", { name: "Write a message" })).toBeEnabled();
+    await expect.poll(() => peerCount(alice)).toBeGreaterThan(0);
+    await expect.poll(() => peerCount(bob)).toBeGreaterThan(0);
+    // The chat composer now enables as soon as the room seat is admitted (solo
+    // visitors can queue messages), which no longer implies the P2P data
+    // channels are open. A round-trip message is the barrier that guarantees a
+    // live peer transport before any interruption scenario begins. The first
+    // minutes of a session can still run a short restart-peer renegotiation
+    // (resume choreography); resend with fresh text until one delivers.
+    let barrierAttempt = 0;
+    await expect.poll(async () => {
+      barrierAttempt++;
+      await sendChat(alice, `pair-ready-ping-${barrierAttempt}`);
+      return bob.getByText(`pair-ready-ping-${barrierAttempt}`, { exact: true }).isVisible().catch(() => false);
+    }, { timeout: 45_000, intervals: [2_500, 2_500, 2_500, 2_500, 2_500, 2_500, 5_000] }).toBe(true);
+    return { alice, aliceContext, aliceFrames, aliceSession, bob, bobContext, bobFrames, bobSession };
+  } catch (error) {
+    try {
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile("e2e-interruption-diagnostics.json", `${JSON.stringify(await dumpTransportLogs([
+        { name: "alice", page: alice },
+        { name: "bob", page: bob },
+      ]), null, 2)}\n`, "utf8");
+    } catch {
+      // Diagnostics are best-effort; never mask the original failure.
+    }
+    throw error;
+  }
 }
 
 test.describe("signaling-only interruptions", () => {
   for (const durationMs of [5_000, 20_000]) {
     test(`preserves chat and the peer connection through a ${durationMs / 1_000}s signaling interruption`, async ({ browser }) => {
       const roomId = String(Math.floor(1000 + Math.random() * 9000));
-      const pair = await createPair(browser, roomId);
+      let pair: Awaited<ReturnType<typeof createPair>> | undefined;
       try {
+        pair = await createPair(browser, roomId);
         const alicePeerCount = await peerCount(pair.alice);
         const bobPeerCount = await peerCount(pair.bob);
         await pair.aliceSession.disconnectSignaling(pair.alice);
@@ -202,9 +272,22 @@ test.describe("signaling-only interruptions", () => {
         await sendChat(pair.alice, `after-recovery-${durationMs}`);
         await expect(pair.bob.getByText(`after-recovery-${durationMs}`, { exact: true })).toBeVisible();
         await expect.poll(() => peerCount(pair.alice)).toBe(alicePeerCount);
+      } catch (error) {
+        if (pair) {
+          try {
+            const { writeFile } = await import("node:fs/promises");
+            await writeFile("e2e-interruption-diagnostics.json", `${JSON.stringify(await dumpTransportLogs([
+              { name: "alice", page: pair.alice },
+              { name: "bob", page: pair.bob },
+            ]), null, 2)}\n`, "utf8");
+          } catch {
+            // Diagnostics are best-effort; never mask the original failure.
+          }
+        }
+        throw error;
       } finally {
-        await pair.aliceContext.close();
-        await pair.bobContext.close();
+        await pair?.aliceContext.close();
+        await pair?.bobContext.close();
       }
     });
   }
@@ -236,6 +319,36 @@ test.describe("signaling-only interruptions", () => {
     } finally {
       await pair.aliceContext.close();
       await pair.bobContext.close();
+    }
+  });
+
+  test("enters chat while alone and syncs queued messages when a peer joins", async ({ browser }) => {
+    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const aliceContext = await browser.newContext();
+    const bobContext = await browser.newContext();
+    const alice = await aliceContext.newPage();
+    const bob = await bobContext.newPage();
+    try {
+      await createRoomPeer(alice, roomId, false);
+      // Solo entry: the workspace opens straight into chat and the composer
+      // is usable with no peer in the room.
+      const composer = alice.getByRole("textbox", { name: "Write a message" });
+      await expect(composer).toBeVisible({ timeout: 20_000 });
+      await expect(composer).toBeEnabled({ timeout: 20_000 });
+      await composer.fill("queued-while-alone");
+      await composer.press("Enter");
+      await expect(alice.getByText("queued-while-alone", { exact: true })).toBeVisible();
+
+      await createRoomPeer(bob, roomId, false);
+      // The queued message syncs as soon as the peer transport opens.
+      await expect(bob.getByText("queued-while-alone", { exact: true })).toBeVisible({ timeout: 30_000 });
+
+      // Live chat continues bidirectionally.
+      await sendChat(bob, "hello-after-join");
+      await expect(alice.getByText("hello-after-join", { exact: true })).toBeVisible();
+    } finally {
+      await aliceContext.close();
+      await bobContext.close();
     }
   });
 

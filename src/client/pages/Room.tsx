@@ -1,6 +1,8 @@
 import {
   RiArrowLeftLine,
   RiAddLine,
+  RiArrowDownSLine,
+  RiArrowUpSLine,
   RiCheckboxCircleFill,
   RiCheckDoubleLine,
   RiCheckLine,
@@ -55,6 +57,7 @@ import {
   RiCameraSwitchLine,
   RiComputerLine,
   RiSettings3Line,
+  RiTimeLine,
   RiVideoOnLine,
   RiWifiLine,
   RiVolumeUpLine,
@@ -98,7 +101,7 @@ type StatusRowProps = {
 };
 
 type ChatMessage = {
-  deliveryStatus?: "sending" | "received" | "read" | "error";
+  deliveryStatus?: "queued" | "sending" | "received" | "read" | "error";
   id: string;
   lastAttemptedAt?: number;
   text: string;
@@ -111,6 +114,7 @@ const workspaceScrollClassName = "min-h-0 flex-1 px-2 pb-7 pt-4 pr-5 [mask-image
 const workspaceComposerClassName = "relative h-28 shrink-0";
 
 function WorkspaceShell({
+  banner,
   children,
   footer,
   reverse = false,
@@ -122,6 +126,7 @@ function WorkspaceShell({
   onSubmit,
   scrollKey,
 }: {
+  banner?: ReactNode;
   children: ReactNode;
   footer: ReactNode;
   reverse?: boolean;
@@ -144,6 +149,7 @@ function WorkspaceShell({
       <OverlayScrollbar className={workspaceScrollClassName} reverse={reverse} syncKey={scrollKey}>
         {children}
       </OverlayScrollbar>
+      {banner}
       <form className="relative shrink-0 border-t border-white/10 pt-4" onSubmit={(event) => {
         event.preventDefault();
         onSubmit?.();
@@ -180,6 +186,9 @@ const ignoreDialogOpenChange = () => undefined;
 
 type RoomLocale = "en" | "zh";
 type WorkspaceId = "chat" | "files" | "video" | "voice" | "watch" | "collaborate" | "canvas" | "status";
+// Whether a peer transport exists: "solo" = seat admitted, nobody else in the
+// room; "away" = had a peer, lost it. Both keep the chat workspace usable.
+type PeerPresence = "solo" | "connecting" | "active" | "away";
 type MeasuredFeature = "camera" | "canvas" | "chat" | "collaborate" | "files" | "screen_share" | "shared_playback" | "voice";
 
 function fileSizeBucket(size: number) {
@@ -203,6 +212,12 @@ const roomCopy = {
     dataChannel: "Data channel",
     ready: "Peer-to-peer connection established",
     readyDescription: "Choose a feature from the buttons below",
+    soloTitle: "Waiting for the other participant",
+    soloDescription: "Open Chat to leave messages — they sync automatically once the other participant joins.",
+    peerAwayTitle: "The other participant is away",
+    peerAwayDescription: "Messages you leave in Chat will sync when they return.",
+    collapseStatus: "Hide connection status",
+    expandStatus: "Show connection status",
     encrypted: "End-to-end encrypted · Direct",
     encryptedRelay: "End-to-end encrypted · Relay",
     leave: "Exit",
@@ -227,6 +242,12 @@ const roomCopy = {
     dataChannel: "数据通道",
     ready: "端对端连接已建立",
     readyDescription: "从下方按钮中选择功能",
+    soloTitle: "等待对方加入",
+    soloDescription: "进入聊天即可留言，对方加入后将自动同步。",
+    peerAwayTitle: "对方暂时离开",
+    peerAwayDescription: "留言将在对方回来后自动同步。",
+    collapseStatus: "收起连接状态",
+    expandStatus: "展开连接状态",
     encrypted: "端对端加密 · 直连",
     encryptedRelay: "端对端加密 · 中继",
     leave: "退出",
@@ -256,6 +277,8 @@ const workspaceCopy = {
     chatPlaceholder: "Write a message",
     chatEmpty: "Send a message to begin your private conversation",
     chatLoadMore: (count: number) => (count === 1 ? "Load 1 earlier message" : `Load ${count} earlier messages`),
+    chatSoloWaiting: "The other participant has not joined yet — messages will sync once they join.",
+    chatPeerAway: "The other participant left — messages will sync when they return.",
     exit: "Exit room",
     exitCancel: "Stay in room",
     exitConfirm: "Exit room",
@@ -280,6 +303,8 @@ const workspaceCopy = {
     chatPlaceholder: "输入消息",
     chatEmpty: "发送一条消息，开始私密对话",
     chatLoadMore: (count: number) => `加载更早的 ${count} 条消息`,
+    chatSoloWaiting: "对方还未加入 · 留言将在其加入后自动同步。",
+    chatPeerAway: "对方已离开 · 留言将在对方回来后自动同步。",
     exit: "退出房间",
     exitCancel: "留在房间",
     exitConfirm: "退出房间",
@@ -504,23 +529,7 @@ function StatusRow({ icon: Icon, label, locale, nonBlockingFailure = false, real
   );
 }
 
-function ConnectionDialog({
-  error,
-  locale,
-  onRequestLeave,
-  onExitComplete,
-  open,
-  progress,
-  roomId,
-}: {
-  error: string | null;
-  locale: RoomLocale;
-  onRequestLeave: () => void;
-  onExitComplete?: () => void;
-  open: boolean;
-  progress: ConnectionProgress;
-  roomId: string;
-}) {
+function useShareRoom(roomId: string, locale: RoomLocale) {
   const copy = roomCopy[locale];
   const [shareStatus, setShareStatus] = useState<"idle" | "copied">("idle");
 
@@ -546,6 +555,103 @@ function ConnectionDialog({
     }
   };
 
+  return { shareRoom, shareStatus };
+}
+
+// The connection card body shared by the blocking ConnectionDialog and the
+// corner ConnectionStatusCard: room number, share/exit actions, and the six
+// connection steps.
+function ConnectionCardDetails({
+  error,
+  locale,
+  onRequestLeave,
+  progress,
+  roomId,
+}: {
+  error: string | null;
+  locale: RoomLocale;
+  onRequestLeave: () => void;
+  progress: ConnectionProgress;
+  roomId: string;
+}) {
+  const copy = roomCopy[locale];
+  const { shareRoom, shareStatus } = useShareRoom(roomId, locale);
+
+  return (
+    <>
+      <div className="flex flex-col gap-5 border-b border-white/10 p-6 sm:flex-row sm:items-center sm:justify-between sm:p-8">
+        <div className="min-w-0">
+          <p className="text-xs font-bold tracking-[0.12em] text-sky-100/50">{copy.room} {roomId}</p>
+          <AutoTransition
+            aria-level={1}
+            className="mt-2 text-2xl font-bold tracking-[0.04em] text-sky-50 sm:text-3xl"
+            duration={0.22}
+            id="connection-title"
+            role="heading"
+            transitionKey={error ? "error" : "connecting"}
+            type="fade"
+          >
+            {error ? copy.connectionErrorTitle : copy.connectingTitle}
+          </AutoTransition>
+          <AutoTransition
+            className="mt-2 text-sm font-medium tracking-[0.04em] text-sky-100/60"
+            duration={0.22}
+            transitionKey={shareStatus === "copied" ? "copied" : error ?? "preparing"}
+            type="fade"
+          >
+            {shareStatus === "copied" ? copy.copied : error ? localizedDetail(locale, error) : copy.preparing(roomId)}
+          </AutoTransition>
+        </div>
+        <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
+          <button
+            aria-label={copy.share}
+            className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-white/[0.1] px-3 text-sm font-semibold tracking-[0.04em] text-sky-100/75 transition-colors hover:bg-white/[0.05] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60 sm:h-10 sm:w-auto"
+            onClick={() => void shareRoom()}
+            type="button"
+          >
+            <RiShareForwardLine aria-hidden="true" className="size-5" />
+            <span>{copy.share}</span>
+          </button>
+          <button
+            aria-label={copy.leave}
+            className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-rose-300/25 bg-rose-500/10 px-3 text-sm font-semibold tracking-[0.04em] text-rose-200 transition-colors hover:bg-rose-500/20 hover:text-rose-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-rose-200/60 sm:h-10 sm:w-auto"
+            onClick={onRequestLeave}
+            type="button"
+          >
+            <RiLogoutBoxRLine aria-hidden="true" className="size-5" />
+            <span>{copy.leave}</span>
+          </button>
+        </div>
+      </div>
+      <div className="divide-y divide-white/10 px-6 sm:px-8">
+        <StatusRow icon={RiGlobalLine} label={copy.resource} locale={locale} nonBlockingFailure status={progress.resource} />
+        <StatusRow icon={RiRouterLine} label={copy.websocket} locale={locale} realtimeConnection status={progress.websocket} />
+        <StatusRow icon={RiGlobalLine} label={copy.stun} locale={locale} nonBlockingFailure status={progress.stun} />
+        <StatusRow icon={RiExchange2Line} label={copy.turn} locale={locale} nonBlockingFailure status={progress.turn} />
+        <StatusRow icon={RiWifiLine} label={copy.p2p} locale={locale} realtimeConnection showPendingLoading status={progress.p2p} />
+        <StatusRow icon={RiRadioButtonLine} label={copy.dataChannel} locale={locale} showPendingLoading status={progress.dataChannel} />
+      </div>
+    </>
+  );
+}
+
+function ConnectionDialog({
+  error,
+  locale,
+  onRequestLeave,
+  onExitComplete,
+  open,
+  progress,
+  roomId,
+}: {
+  error: string | null;
+  locale: RoomLocale;
+  onRequestLeave: () => void;
+  onExitComplete?: () => void;
+  open: boolean;
+  progress: ConnectionProgress;
+  roomId: string;
+}) {
   return (
     <Dialog
       open={open}
@@ -554,58 +660,7 @@ function ConnectionDialog({
       transitionDuration={0.18}
     >
       <DialogContent fadeDuration={0.18} fadeOnly aria-labelledby="connection-title" className="!max-w-2xl">
-          <div className="flex flex-col gap-5 border-b border-white/10 p-6 sm:flex-row sm:items-center sm:justify-between sm:p-8">
-            <div className="min-w-0">
-              <p className="text-xs font-bold tracking-[0.12em] text-sky-100/50">{copy.room} {roomId}</p>
-              <AutoTransition
-                aria-level={1}
-                className="mt-2 text-2xl font-bold tracking-[0.04em] text-sky-50 sm:text-3xl"
-                duration={0.22}
-                id="connection-title"
-                role="heading"
-                transitionKey={error ? "error" : "connecting"}
-                type="fade"
-              >
-                {error ? copy.connectionErrorTitle : copy.connectingTitle}
-              </AutoTransition>
-              <AutoTransition
-                className="mt-2 text-sm font-medium tracking-[0.04em] text-sky-100/60"
-                duration={0.22}
-                transitionKey={shareStatus === "copied" ? "copied" : error ?? "preparing"}
-                type="fade"
-              >
-                {shareStatus === "copied" ? copy.copied : error ? localizedDetail(locale, error) : copy.preparing(roomId)}
-              </AutoTransition>
-            </div>
-            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
-              <button
-                aria-label={copy.share}
-                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-white/[0.1] px-3 text-sm font-semibold tracking-[0.04em] text-sky-100/75 transition-colors hover:bg-white/[0.05] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60 sm:h-10 sm:w-auto"
-                onClick={() => void shareRoom()}
-                type="button"
-              >
-                <RiShareForwardLine aria-hidden="true" className="size-5" />
-                <span>{copy.share}</span>
-              </button>
-              <button
-                aria-label={copy.leave}
-                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-rose-300/25 bg-rose-500/10 px-3 text-sm font-semibold tracking-[0.04em] text-rose-200 transition-colors hover:bg-rose-500/20 hover:text-rose-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-rose-200/60 sm:h-10 sm:w-auto"
-                onClick={onRequestLeave}
-                type="button"
-              >
-                <RiLogoutBoxRLine aria-hidden="true" className="size-5" />
-                <span>{copy.leave}</span>
-              </button>
-            </div>
-          </div>
-          <div className="divide-y divide-white/10 px-6 sm:px-8">
-            <StatusRow icon={RiGlobalLine} label={copy.resource} locale={locale} nonBlockingFailure status={progress.resource} />
-            <StatusRow icon={RiRouterLine} label={copy.websocket} locale={locale} realtimeConnection status={progress.websocket} />
-            <StatusRow icon={RiGlobalLine} label={copy.stun} locale={locale} nonBlockingFailure status={progress.stun} />
-            <StatusRow icon={RiExchange2Line} label={copy.turn} locale={locale} nonBlockingFailure status={progress.turn} />
-            <StatusRow icon={RiWifiLine} label={copy.p2p} locale={locale} realtimeConnection showPendingLoading status={progress.p2p} />
-            <StatusRow icon={RiRadioButtonLine} label={copy.dataChannel} locale={locale} showPendingLoading status={progress.dataChannel} />
-          </div>
+        <ConnectionCardDetails error={error} locale={locale} onRequestLeave={onRequestLeave} progress={progress} roomId={roomId} />
       </DialogContent>
     </Dialog>
   );
@@ -801,8 +856,76 @@ function StatusMetric({ icon: Icon, label, locale, realtimeConnection = false, s
 const CHAT_RENDER_LIMIT = 50;
 const CHAT_RENDER_STEP = 50;
 
+// Slim hint above the chat composer while there is no peer transport. The
+// room number and share action live in the corner ConnectionStatusCard, so
+// this banner stays text-only.
+function ChatPresenceBanner({ locale, mode }: { locale: RoomLocale; mode: "solo" | "away" }) {
+  const workspace = workspaceCopy[locale];
+  return (
+    <div
+      className="mb-3 flex shrink-0 items-center gap-2 rounded-xl border border-sky-200/10 bg-sky-100/[0.04] px-4 py-2.5 text-xs font-medium leading-relaxed tracking-[0.03em] text-sky-100/60"
+      role="status"
+    >
+      <RiTimeLine aria-hidden="true" className="size-4 shrink-0" />
+      <span className="min-w-0">{mode === "solo" ? workspace.chatSoloWaiting : workspace.chatPeerAway}</span>
+    </div>
+  );
+}
+
+// The connection card in corner form: same information as the blocking
+// ConnectionDialog (room number, share/exit, six connection steps), floating
+// top-right over the workspace while no peer transport exists so it never
+// blocks the conversation. Collapses to a slim bar.
+function ConnectionStatusCard({
+  locale,
+  onRequestLeave,
+  progress,
+  roomId,
+}: {
+  locale: RoomLocale;
+  onRequestLeave: () => void;
+  progress: ConnectionProgress;
+  roomId: string;
+}) {
+  const copy = roomCopy[locale];
+  const [collapsed, setCollapsed] = useState(false);
+  const toggleClassName = "inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-sky-100/60 transition-colors hover:bg-white/[0.06] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60";
+
+  if (collapsed) {
+    return (
+      <aside aria-label={copy.connectingTitle} className="glass absolute right-0 top-0 z-20 flex items-center gap-1.5 rounded-2xl py-1.5 pl-4 pr-2 text-gray-100 shadow-xl shadow-black/30">
+        <RiTimeLine aria-hidden="true" className="size-4 shrink-0 text-sky-100/60" />
+        <p className="min-w-0 text-xs font-bold tracking-[0.12em] text-sky-100/60">{copy.room} {roomId}</p>
+        <button
+          aria-label={copy.expandStatus}
+          className={toggleClassName}
+          onClick={() => setCollapsed(false)}
+          type="button"
+        >
+          <RiArrowDownSLine aria-hidden="true" className="size-4" />
+        </button>
+      </aside>
+    );
+  }
+
+  return (
+    <aside aria-label={copy.connectingTitle} className="glass absolute right-0 top-0 z-20 w-[min(23rem,92vw)] origin-top-right scale-[0.88] overflow-hidden rounded-2xl text-gray-100 shadow-xl shadow-black/30">
+      <button
+        aria-label={copy.collapseStatus}
+        className="absolute right-1.5 top-1.5 z-10 inline-flex size-7 items-center justify-center rounded-lg text-sky-100/50 transition-colors hover:bg-white/[0.06] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60"
+        onClick={() => setCollapsed(true)}
+        type="button"
+      >
+        <RiArrowUpSLine aria-hidden="true" className="size-4" />
+      </button>
+      <ConnectionCardDetails error={null} locale={locale} onRequestLeave={onRequestLeave} progress={progress} roomId={roomId} />
+    </aside>
+  );
+}
+
 function ChatWorkspace({
   accent,
+  banner,
   emptyMessage,
   loadMoreLabel,
   messages,
@@ -815,6 +938,7 @@ function ChatWorkspace({
   typingLabel,
 }: {
   accent: string;
+  banner?: ReactNode;
   emptyMessage: string;
   loadMoreLabel: (count: number) => string;
   messages: ChatMessage[];
@@ -875,6 +999,7 @@ function ChatWorkspace({
 
   return (
     <WorkspaceShell
+      banner={banner}
       footer={(
         <>
           <textarea
@@ -990,8 +1115,16 @@ function ChatDeliveryStatus({ status }: { status: NonNullable<ChatMessage["deliv
       ? RiCheckLine
       : status === "error"
         ? RiErrorWarningLine
-        : RiLoader4Line;
-  const color = status === "error" ? "text-rose-300/80" : status === "read" ? "text-sky-100/70" : "text-sky-100/60";
+        : status === "queued"
+          ? RiTimeLine
+          : RiLoader4Line;
+  const color = status === "error"
+    ? "text-rose-300/80"
+    : status === "read"
+      ? "text-sky-100/70"
+      : status === "queued"
+        ? "text-sky-100/45"
+        : "text-sky-100/60";
 
   // No AutoTransition here on purpose: its AnimatePresence mode="wait" gates
   // the icon swap on the old icon's exit animation, which is rAF-driven and
@@ -2345,6 +2478,7 @@ function FileWorkspace({ accent, files, locale, onAccept, onCancel, onDelete, on
 
 function RoomWorkspace({
   chatMessages,
+  chatSeatAdmitted,
   canvasHasContent,
   collaborationProvider,
   collaborationPeerCursor,
@@ -2395,6 +2529,7 @@ function RoomWorkspace({
   volume,
   onVolumeChange,
   peerTyping,
+  peerPresence,
   open,
   progress,
   roomId,
@@ -2405,6 +2540,7 @@ function RoomWorkspace({
   videoActive,
 }: {
   chatMessages: ChatMessage[];
+  chatSeatAdmitted: boolean;
   canvasHasContent: boolean;
   collaborationProvider: P2PCollaborationProvider | null;
   collaborationPeerCursor: boolean;
@@ -2455,6 +2591,7 @@ function RoomWorkspace({
   volume: number;
   onVolumeChange: (value: number) => void;
   peerTyping: boolean;
+  peerPresence: PeerPresence;
   open: boolean;
   progress: ConnectionProgress;
   roomId: string;
@@ -2518,6 +2655,17 @@ function RoomWorkspace({
     if (window.location.hash !== hash) window.history.pushState(null, "", hash);
     setRunningWorkspaces((current) => current.includes(workspaceId) ? current : [...current, workspaceId]);
   };
+
+  // Land a solo visitor straight in the conversation so they can leave
+  // messages. One-shot: it never overrides later navigation, and an explicit
+  // #hash on entry (activeWorkspace already set) always wins.
+  const soloChatAutoOpenRef = useRef(false);
+  useEffect(() => {
+    if (!open || soloChatAutoOpenRef.current) return;
+    if (peerPresence !== "solo" || activeWorkspace !== null) return;
+    soloChatAutoOpenRef.current = true;
+    activateWorkspace("chat");
+  }, [open, peerPresence, activeWorkspace]);
 
   const fileRunning = fileTransfers.some((file) => file.state === "transferring");
   const pendingFileRequests = fileTransfers.filter((file) => file.direction === "incoming" && file.state === "offered").length;
@@ -2625,11 +2773,17 @@ function RoomWorkspace({
               {activeWorkspace === null ? (
                 <section className="flex min-h-0 w-full flex-1 items-center justify-center py-6 text-center">
                   <div className="w-full max-w-2xl">
-                    <RiCheckboxCircleFill aria-hidden="true" className="mx-auto size-12 text-emerald-300" />
+                    {peerPresence === "active" ? (
+                      <RiCheckboxCircleFill aria-hidden="true" className="mx-auto size-12 text-emerald-300" />
+                    ) : (
+                      <RiTimeLine aria-hidden="true" className="mx-auto size-12 text-sky-300/70" />
+                    )}
                     <p className="mt-5 text-xs font-bold tracking-[0.12em] text-sky-100/50">{workspace.room} {roomId}</p>
-                    <h1 id="connection-ready-title" className="zest-room-heading mt-2 text-3xl font-bold tracking-[0.04em] text-sky-50">{copy.ready}</h1>
+                    <h1 id="connection-ready-title" className="zest-room-heading mt-2 text-3xl font-bold tracking-[0.04em] text-sky-50">
+                      {peerPresence === "active" ? copy.ready : peerPresence === "away" ? copy.peerAwayTitle : copy.soloTitle}
+                    </h1>
                     <p className="zest-room-copy mx-auto mt-4 max-w-lg text-sm font-medium leading-relaxed tracking-[0.04em] text-sky-100/65">
-                      {copy.readyDescription}
+                      {peerPresence === "active" ? copy.readyDescription : peerPresence === "away" ? copy.peerAwayDescription : copy.soloDescription}
                     </p>
                   </div>
                 </section>
@@ -2643,6 +2797,9 @@ function RoomWorkspace({
                     {activeWorkspace === "chat" ? (
                       <ChatWorkspace
                         accent={theme.accent}
+                        banner={peerPresence === "solo" || peerPresence === "away" ? (
+                          <ChatPresenceBanner locale={locale} mode={peerPresence} />
+                        ) : undefined}
                         emptyMessage={workspace.chatEmpty}
                         loadMoreLabel={workspace.chatLoadMore}
                         messages={chatMessages}
@@ -2651,7 +2808,7 @@ function RoomWorkspace({
                         onTyping={onChatTyping}
                         peerTyping={peerTyping}
                         placeholder={workspace.chatPlaceholder}
-                        ready={progress.dataChannel.state === "active"}
+                        ready={chatSeatAdmitted}
                         typingLabel={workspace.typing}
                       />
                     ) : activeWorkspace === "files" ? (
@@ -2750,6 +2907,14 @@ function RoomWorkspace({
                 );
               })()}
             </AutoTransition>
+            {open && (peerPresence === "solo" || peerPresence === "away") ? (
+              <ConnectionStatusCard
+                locale={locale}
+                onRequestLeave={() => setExitDialogOpen(true)}
+                progress={progress}
+                roomId={roomId}
+              />
+            ) : null}
           </main>
 
           {activeWorkspace !== "video" ? <FloatingVideoSidecars media={media} locale={locale} onFocus={(tileId) => {
@@ -2852,7 +3017,15 @@ function RoomFullContent({ locale, onLeave, roomId }: { locale: RoomLocale; onLe
 
 export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: string }) {
   const navigate = useNavigate();
-  const [dialogPhase, setDialogPhase] = useState<"connecting" | "closing-for-full" | "closing-for-leave" | "closing-for-ready" | "closing-for-reconnect" | "full" | "ready">("connecting");
+  // Start in the workspace: a solo visitor can chat (and leave messages)
+  // immediately while connection progress lives in the corner status card.
+  // The blocking ConnectionDialog is reserved for reconnect/leave/full phases.
+  const [dialogPhase, setDialogPhase] = useState<"connecting" | "closing-for-full" | "closing-for-leave" | "closing-for-ready" | "closing-for-reconnect" | "full" | "ready">("ready");
+  const dialogPhaseRef = useRef(dialogPhase);
+  dialogPhaseRef.current = dialogPhase;
+  const [peerPresence, setPeerPresence] = useState<PeerPresence>("solo");
+  const peerEverConnectedRef = useRef(false);
+  const [chatSeatAdmitted, setChatSeatAdmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const [connectionRoute, setConnectionRoute] = useState<ConnectionRoute>("direct");
@@ -3350,8 +3523,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     if (peerTypingTimerRef.current !== null) window.clearTimeout(peerTypingTimerRef.current);
     peerTypingTimerRef.current = null;
     setPeerTyping(false);
-    chatMessagesRef.current = [];
-    setChatMessages([]);
+    // Chat history intentionally survives a peer leaving: the conversation is
+    // room-scoped and queued messages must sync when someone rejoins.
     if (fileTransferRefreshTimerRef.current !== null) window.clearTimeout(fileTransferRefreshTimerRef.current);
     fileTransferRefreshTimerRef.current = null;
     fileTransfersRef.current = [];
@@ -3386,6 +3559,9 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   useEffect(() => {
     renewPeerSessionScope();
+    peerEverConnectedRef.current = false;
+    setPeerPresence("solo");
+    setChatSeatAdmitted(false);
     const showReconnectDialog = (detail = "Reconnecting signaling socket") => {
       setError(detail);
       setDialogPhase((current) => current === "ready" ? "closing-for-reconnect" : current === "closing-for-reconnect" ? current : "connecting");
@@ -3415,15 +3591,26 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           trackInsightEvent("p2p_session_connected", { locale });
         }
         setError(null);
-        setDialogPhase("closing-for-ready");
+        // Only route through the dialog-exit state when the blocking dialog is
+        // actually mounted (phase "connecting"). The workspace is the default
+        // phase now, and the dialog's AnimatePresence never fires
+        // onExitComplete for a dialog that never opened — a direct flip avoids
+        // stranding the room on a blank screen. "closing-for-reconnect" means
+        // the workspace is showing with a pending modal timer; settle on
+        // "ready" to cancel it.
+        setDialogPhase((current) => current === "connecting" ? "closing-for-ready" : current === "closing-for-reconnect" ? "ready" : current);
       },
       setError,
       () => {
         session.close();
-        setDialogPhase("closing-for-full");
+        // From the blocking dialog let its exit animation run; from the
+        // workspace (dialog never opened) jump straight to the full screen.
+        setDialogPhase((current) => current === "connecting" ? "closing-for-full" : "full");
       },
       () => {
-        if (resetParticipantResources(session)) showReconnectDialog("Waiting for the other participant to reconnect");
+        // Stay in the workspace: the presence banner and corner status card
+        // take over, and queued messages sync when the peer returns.
+        resetParticipantResources(session);
       },
       setConnectionRoute,
       (message) => {
@@ -3455,6 +3642,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       handleSharedPlaybackMessage,
       (status: SessionStatus) => {
         if (status.p2pState === "connected") {
+          peerEverConnectedRef.current = true;
+          setPeerPresence("active");
           setError(null);
           if (status.signalingState === "reconnecting" || status.signalingState === "unavailable"
             || status.seatState === "verification-required" || status.seatState === "expired") {
@@ -3472,20 +3661,43 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           } else {
             setConnectionNotice(null);
           }
-          setDialogPhase((current) => current === "closing-for-reconnect" || current === "connecting"
+          setDialogPhase((current) => current === "connecting"
             ? "closing-for-ready"
-            : current);
+            : current === "closing-for-reconnect"
+              ? "ready"
+              : current);
           return;
         }
         setConnectionNotice(null);
+        if (status.p2pState === "negotiating" || status.p2pState === "recovering") setPeerPresence("connecting");
+        else setPeerPresence(peerEverConnectedRef.current ? "away" : "solo");
+        if (status.seatState === "confirmed") setChatSeatAdmitted(true);
+        else if (status.seatState === "replaced" || status.signalingState === "closed") setChatSeatAdmitted(false);
         if (status.state === "reconnecting" || status.state === "reserved") {
-          showReconnectDialog(status.detail);
+          if (dialogPhaseRef.current === "ready" && status.p2pState === "waiting") {
+            // Alone in the room with no peer transport to recover: keep the
+            // workspace so the visitor can keep leaving messages; surface a
+            // notice instead of the blocking dialog.
+            setConnectionNotice(localizedDetail(locale, status.detail ?? "Reconnecting signaling socket"));
+          } else {
+            showReconnectDialog(status.detail);
+          }
           return;
         }
         if (status.state === "connected") setError(null);
+        if (status.state === "connected" && status.signalingState === "connected"
+          && status.seatState === "confirmed" && status.p2pState === "waiting") {
+          // Seat admitted and nobody else in the room: make sure the workspace
+          // is showing (e.g. returning from the reconnect dialog).
+          setDialogPhase((current) => current === "connecting"
+            ? "closing-for-ready"
+            : current === "closing-for-reconnect"
+              ? "ready"
+              : current);
+        }
       },
       () => {
-        if (resetParticipantResources(session)) showReconnectDialog("Connecting to the new participant");
+        resetParticipantResources(session);
       },
     );
     sessionRef.current = session;
@@ -3620,12 +3832,16 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   const sendChatMessage = (text: string): boolean => {
     const message = text.trim();
+    if (!message) return false;
     const id = cuid();
-    if (!sessionRef.current?.sendChatMessage(id, message)) return false;
+    // With no peer transport the channel send fails; queue the message locally
+    // instead — onConnected resends everything not yet read/received, so it
+    // syncs as soon as someone joins.
+    const delivered = sessionRef.current?.sendChatMessage(id, message) ?? false;
     updateChatMessages((current) => appendChatMessage(current, {
-      deliveryStatus: "sending",
+      deliveryStatus: delivered ? "sending" : "queued",
       id,
-      lastAttemptedAt: Date.now(),
+      ...(delivered ? { lastAttemptedAt: Date.now() } : {}),
       sender: "local",
       sentAt: Date.now(),
       text: message,
@@ -4048,6 +4264,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         <RoomWorkspace
           canvasHasContent={canvasHasContent}
           chatMessages={chatMessages}
+          chatSeatAdmitted={chatSeatAdmitted}
           collaborationProvider={collaborationProvider}
           collaborationPeerCursor={collaborationPeerCursor}
           fileTransfers={fileTransfers}
@@ -4097,6 +4314,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           onSharedPlaybackVolumeChange={setSharedPlaybackVolume}
           videoQuality={videoQuality}
           open={dialogPhase === "ready"}
+          peerPresence={peerPresence}
           peerTyping={peerTyping}
           progress={progress}
           roomId={roomId}
