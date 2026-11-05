@@ -150,6 +150,8 @@ export const appThemes: readonly AppTheme[] = [
 ] as const;
 
 const storageKey = "zestsend-theme";
+// Default for visitors without a stored choice (existing localStorage picks win).
+const DEFAULT_THEME_ID: ThemeId = "seeker-blue";
 
 type ThemeContextValue = {
   setThemeId: (id: ThemeId) => void;
@@ -165,9 +167,9 @@ function isThemeId(value: string | null): value is ThemeId {
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [themeId, setThemeId] = useState<ThemeId>(() => {
-    if (typeof window === "undefined") return "midnight-drift";
+    if (typeof window === "undefined") return DEFAULT_THEME_ID;
     const storedThemeId = window.localStorage.getItem(storageKey);
-    return isThemeId(storedThemeId) ? storedThemeId : "midnight-drift";
+    return isThemeId(storedThemeId) ? storedThemeId : DEFAULT_THEME_ID;
   });
 
   const theme = useMemo(
