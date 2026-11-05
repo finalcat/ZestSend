@@ -1,7 +1,11 @@
 import Layout from "../components/Layout";
+import { useTheme } from "../components/theme";
 import { CursorDrivenParticleTypography } from "../components/ui/cursor-driven-particle-typography";
 
 export default function NotFound() {
+  const { theme } = useTheme();
+  const particleColor = theme.scheme === "light" ? "#1a2433" : "#d9f4ff";
+
   return (
     <Layout title="ZestSend — 404">
       <main
@@ -15,7 +19,7 @@ export default function NotFound() {
         <CursorDrivenParticleTypography
           aria-hidden="true"
           className="h-[min(30vw,15rem)] min-h-0 max-w-5xl"
-          color="#d9f4ff"
+          color={particleColor}
           fontFamily="Aptos Display, Segoe UI, sans-serif"
           fontSize={180}
           particleDensity={2}
@@ -25,7 +29,7 @@ export default function NotFound() {
         <CursorDrivenParticleTypography
           aria-hidden="true"
           className="h-[min(22vw,10rem)] min-h-0 max-w-3xl"
-          color="#d9f4ff"
+          color={particleColor}
           fontFamily="Aptos Display, Segoe UI, sans-serif"
           fontSize={120}
           particleDensity={2}

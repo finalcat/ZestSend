@@ -411,14 +411,14 @@ function StatusRow({ icon: Icon, label, locale, nonBlockingFailure = false, real
   const failed = status.state === "error";
   const pending = status.state === "pending";
   const iconTone = active
-    ? { backgroundColor: "rgba(52, 211, 153, 0.15)", color: "rgb(110, 231, 183)" }
+    ? { backgroundColor: "var(--zest-chip-ok-bg)", color: "var(--zest-chip-ok-fg)" }
     : failed
       ? nonBlockingFailure
-        ? { backgroundColor: "rgba(251, 191, 36, 0.15)", color: "rgb(252, 211, 77)" }
-        : { backgroundColor: "rgba(251, 113, 133, 0.15)", color: "rgb(253, 164, 175)" }
+        ? { backgroundColor: "var(--zest-chip-warn-bg)", color: "var(--zest-chip-warn-fg)" }
+        : { backgroundColor: "var(--zest-chip-err-bg)", color: "var(--zest-chip-err-fg)" }
       : pending
-        ? { backgroundColor: "rgba(148, 163, 184, 0.12)", color: "rgb(148, 163, 184)" }
-        : { backgroundColor: "rgba(56, 189, 248, 0.15)", color: "rgb(125, 211, 252)" };
+        ? { backgroundColor: "var(--zest-chip-idle-bg)", color: "var(--zest-chip-idle-fg)" }
+        : { backgroundColor: "var(--zest-chip-info-bg)", color: "var(--zest-chip-info-fg)" };
 
   return (
     <div className="flex min-h-20 items-center gap-4 py-3 sm:gap-5">
@@ -921,8 +921,8 @@ function ChatWorkspace({
                         <p
                           className={`relative whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm font-medium leading-relaxed tracking-[0.03em] ${isLocal ? "rounded-br-none" : "rounded-bl-none"}`}
                           style={isLocal
-                            ? { backgroundColor: `${accent}40`, color: "rgb(240 249 255 / 0.96)" }
-                            : { backgroundColor: "rgb(0 0 0 / 0.25)", color: "rgb(224 242 254 / 0.88)" }}
+                            ? { backgroundColor: `${accent}40`, color: "var(--zest-ink-strong)" }
+                            : { backgroundColor: "var(--zest-bubble-remote-bg)", color: "var(--zest-bubble-remote-fg)" }}
                         >
                           {message.text}
                         </p>
@@ -1799,7 +1799,7 @@ function WatchWorkspace({
           disabled={!ready || !playback}
           hoverScale={1.08}
           onClick={() => onControl("stop")}
-          style={playback ? { backgroundColor: "rgba(136, 19, 55, 0.45)", borderColor: "rgba(244, 63, 94, 0.42)", color: "rgb(255 228 230)" } : { backgroundColor: "rgb(0 0 0 / 0.25)" }}
+          style={playback ? { backgroundColor: "var(--zest-stop-bg)", borderColor: "var(--zest-stop-border)", color: "var(--zest-stop-fg)" } : { backgroundColor: "var(--zest-btn-inactive)" }}
           tapScale={0.94}
         ><RiStopLine aria-hidden="true" className="size-7" /></Clickable>
         <span className="pointer-events-none hidden min-h-4 select-none text-xs font-bold tracking-[0.08em] text-sky-100/55 sm:block">{copy.stop}</span>
@@ -2256,10 +2256,10 @@ function FileWorkspace({ accent, files, locale, onAccept, onCancel, onDelete, on
         const action = (label: string, IconComponent: typeof RiEyeLine, onClick: () => void, style?: CSSProperties, disabled = false, transitionKey = label) => <Clickable className="h-full w-full min-w-0" disabled={disabled} enableHoverScale hoverScale={1.035} interactive={false} tapScale={0.97}><button className={`${actionClass} h-full w-full`} disabled={disabled} onClick={onClick} style={style} type="button"><AutoTransition as="span" className="inline-flex min-w-0 items-center justify-center gap-1.5" duration={0.18} presenceMode="wait" transitionKey={transitionKey} type="fade"><IconComponent aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{label}</span></AutoTransition></button></Clickable>;
         let actions: ReactNode[];
         if (isIncoming && file.state === "offered") actions = [action(copy.preview, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.accept, RiDownload2Line, () => onAccept(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.reject, RiDeleteBinLine, () => onCancel(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
-        else if (isIncoming && active) actions = [action(copy.preview, RiEyeLine, preview, undefined, true), action(file.paused ? copy.resume : copy.pause, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.stop, RiStopLine, () => onCancel(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
+        else if (isIncoming && active) actions = [action(copy.preview, RiEyeLine, preview, undefined, true), action(file.paused ? copy.resume : copy.pause, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "var(--zest-accept-tint)" }), action(copy.stop, RiStopLine, () => onCancel(file.id), { backgroundColor: "var(--zest-reject-tint)" })];
         else if (isIncoming && file.state === "complete") actions = [action(copy.view, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.save, RiDownload2Line, () => onDownload(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.remove, RiDeleteBinLine, () => onDelete(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
         else if (!isIncoming && file.state === "complete") actions = [action(copy.view, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.resend, RiRefreshLine, () => onResend(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.cancel, RiDeleteBinLine, () => onDelete(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
-        else actions = [action(copy.view, RiEyeLine, preview), action(active && !file.paused ? copy.pause : copy.resume, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }, !active), action(copy.cancel, RiCloseCircleFill, () => onCancel(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
+        else actions = [action(copy.view, RiEyeLine, preview), action(active && !file.paused ? copy.pause : copy.resume, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "var(--zest-accept-tint)" }, !active), action(copy.cancel, RiCloseCircleFill, () => onCancel(file.id), { backgroundColor: "var(--zest-reject-tint)" })];
         return <motion.article animate={{ opacity: 1, y: 0 }} className="overflow-hidden border-b border-white/10 pb-4" exit={{ height: 0, opacity: 0, y: -10, paddingBottom: 0 }} initial={{ opacity: 0, y: 10 }} key={file.id} layout transition={{ layout: { duration: 0.3, ease: "easeOut" }, opacity: { duration: 0.18 }, height: { duration: 0.26, ease: "easeInOut" }, y: { duration: 0.22, ease: "easeOut" } }}><div className="flex min-w-0 items-stretch gap-3"><button aria-label={file.name} className="grid aspect-square w-16 shrink-0 place-items-center text-sky-200/65" onClick={() => openDiagnostics(file)} type="button"><Icon aria-hidden="true" className="size-11" /></button><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold tracking-[0.04em] text-sky-50">{file.name}</p><div className="mt-3 space-y-1.5"><div className="h-1.5 overflow-hidden rounded-full bg-white/10"><motion.div animate={{ width: `${progress}%` }} className="h-full rounded-full" initial={{ width: "0%" }} style={{ backgroundColor: accent }} transition={{ type: "spring", stiffness: 220, damping: 28 }} /></div><div className="h-1.5 overflow-hidden rounded-full bg-white/[0.07]"><motion.div animate={{ width: `${confirmed}%` }} className="h-full rounded-full bg-sky-100/45" initial={{ width: "0%" }} transition={{ type: "spring", stiffness: 220, damping: 28 }} /></div></div><NumberFlowGroup><motion.div layout="position" className="mt-2 flex flex-wrap items-baseline gap-y-1 text-xs font-medium text-sky-100/45" transition={{ layout: { duration: 0.32, ease: "easeOut" } }}><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><NumberFlow value={Math.round(progress)} willChange /><motion.span layout="position">%</motion.span></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><FileSizeValue bytes={file.transferredBytes} /><motion.span layout="position" className="mx-1">/</motion.span><FileSizeValue bytes={file.size} /></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums">{displaySpeed > 0 ? <FileSizeValue bytes={displaySpeed} suffix="/s" /> : <motion.span layout="position">-- /s</motion.span>}</motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><EtaValue seconds={eta} /></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex"><AutoTransition as="span" className="inline-flex tracking-[0.03em]" duration={0.18} presenceMode="wait" transitionKey={`${file.state}-${file.paused}-${file.error ?? ""}`} type="fade">{stateLabel(file)}</AutoTransition></motion.span></motion.div></NumberFlowGroup><div className="mt-3 grid grid-cols-3 gap-2">{actions}</div></div></div></motion.article>;
       })}</AnimatePresence></div>}
       <Dialog open={previewFile !== null} onOpenChange={(open) => { if (!open) setPreviewFile(null); }}>
@@ -2730,6 +2730,7 @@ function RoomWorkspace({
             >
               <MagneticDock
                 activeColor={theme.accent}
+                iconColor={theme.scheme === "light" ? "rgb(26 36 51 / 0.9)" : undefined}
                 iconOnly
                 iconSize={64}
                 items={dockItems}

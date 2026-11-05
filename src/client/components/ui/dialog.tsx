@@ -104,7 +104,7 @@ export function Dialog({
             animate={overlay ? { backgroundColor: "rgba(0, 0, 0, 0.65)", opacity: 1 } : { opacity: 1 }}
             aria-label="Dialog overlay"
             className={cn(
-              "fixed inset-0 z-[100] flex items-center justify-center",
+              "zest-dialog-overlay fixed inset-0 z-[100] flex items-center justify-center",
               !fullScreen && "p-4 sm:p-8",
               overlay && "backdrop-blur-sm",
             )}

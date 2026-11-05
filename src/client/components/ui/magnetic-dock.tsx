@@ -21,6 +21,8 @@ interface MagneticDockProps {
     iconOnly?: boolean
     /** Accent applied to the active item */
     activeColor?: string
+    /** Icon color for non-danger items (defaults to light ink) */
+    iconColor?: string
     /** Custom class name */
     className?: string
 }
@@ -54,6 +56,7 @@ interface DockItemProps {
     isVertical: boolean
     iconOnly: boolean
     activeColor: string
+    iconColor?: string
 }
 
 function DockItem({
@@ -66,6 +69,7 @@ function DockItem({
     isVertical,
     iconOnly,
     activeColor,
+    iconColor = "rgb(224 242 254 / 0.9)",
 }: DockItemProps) {
     const ref = React.useRef<HTMLButtonElement>(null)
     const [isHovered, setIsHovered] = React.useState(false)
@@ -136,20 +140,18 @@ function DockItem({
                     "flex items-center justify-center",
                     "transition-all duration-200"
                 )}
-                animate={{
+                style={{
                     backgroundColor: item.tone === "danger"
-                        ? "rgba(136, 19, 55, 0.45)"
-                        : item.running ? "rgba(52, 211, 153, 0.25)" : item.isActive ? `${activeColor}33` : "rgba(0, 0, 0, 0.25)",
+                        ? "var(--zest-dock-danger-bg)"
+                        : item.running ? "var(--zest-dock-running)" : item.isActive ? `${activeColor}33` : "var(--zest-dock-idle)",
                     borderColor: item.tone === "danger"
-                        ? "rgba(244, 63, 94, 0.42)"
-                        : "rgba(255, 255, 255, 0.1)",
-                    boxShadow: "0 0 0 rgba(0, 0, 0, 0)",
+                        ? "var(--zest-stop-border)"
+                        : "var(--zest-dock-border)",
                 }}
-                transition={{ duration: 0.2, ease: "easeOut" }}
             >
                 {/* Icon */}
                 <motion.div
-                    animate={{ color: item.tone === "danger" ? "rgb(255 228 230)" : "rgb(224 242 254 / 0.9)" }}
+                    animate={{ color: item.tone === "danger" ? "rgb(255 228 230)" : iconColor }}
                     className="flex h-[60%] w-[60%] items-center justify-center"
                     transition={{ duration: 0.18, ease: "easeOut" }}
                 >
@@ -225,6 +227,7 @@ function MagneticDock({
     variant = "glass",
     iconOnly = false,
     activeColor = "#67d5ff",
+    iconColor,
     className,
 }: MagneticDockProps) {
     const mousePosition = useMotionValue(Infinity)
@@ -285,6 +288,7 @@ function MagneticDock({
                     isVertical={isVertical}
                     iconOnly={iconOnly}
                     activeColor={activeColor}
+                    iconColor={iconColor}
                 />
             ))}
         </motion.div>

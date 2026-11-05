@@ -818,3 +818,369 @@ html[data-native-scrollbars="true"]::-webkit-scrollbar {
     transition: none !important;
   }
 }
+
+/* ---- Semantic state tokens (dark defaults = historic literal values) ---- */
+:root {
+  --zest-ink-strong: rgb(240 249 255 / 0.96);
+  --zest-bubble-remote-bg: rgb(0 0 0 / 0.25);
+  --zest-bubble-remote-fg: rgb(224 242 254 / 0.88);
+  --zest-btn-inactive: rgb(0 0 0 / 0.25);
+  --zest-stop-bg: rgba(136, 19, 55, 0.45);
+  --zest-stop-border: rgba(244, 63, 94, 0.42);
+  --zest-stop-fg: rgb(255 228 230);
+  --zest-chip-ok-bg: rgba(52, 211, 153, 0.15);
+  --zest-chip-ok-fg: rgb(110, 231, 183);
+  --zest-chip-warn-bg: rgba(251, 191, 36, 0.15);
+  --zest-chip-warn-fg: rgb(252, 211, 77);
+  --zest-chip-err-bg: rgba(251, 113, 133, 0.15);
+  --zest-chip-err-fg: rgb(253, 164, 175);
+  --zest-chip-idle-bg: rgba(148, 163, 184, 0.12);
+  --zest-chip-idle-fg: rgb(148, 163, 184);
+  --zest-chip-info-bg: rgba(56, 189, 248, 0.15);
+  --zest-chip-info-fg: rgb(125, 211, 252);
+  --zest-accept-tint: rgba(16, 185, 129, 0.28);
+  --zest-reject-tint: rgba(244, 63, 94, 0.28);
+  --zest-dock-danger-bg: rgba(136, 19, 55, 0.45);
+  --zest-dock-running: rgba(52, 211, 153, 0.25);
+  --zest-dock-idle: rgba(0, 0, 0, 0.25);
+  --zest-dock-border: rgba(255, 255, 255, 0.1);
+  --zest-progress-track: rgba(224, 242, 254, 0.48);
+  --zest-particle-ink: #d9f4ff;
+}
+
+/* ---- Seeker Blue (DeepSeek-style light skin) ---- */
+[data-theme="seeker-blue"] {
+  --zest-ink-strong: #1a2433;
+  --zest-bubble-remote-bg: rgb(16 24 40 / 0.05);
+  --zest-bubble-remote-fg: rgb(26 36 51 / 0.88);
+  --zest-btn-inactive: rgb(16 24 40 / 0.05);
+  --zest-stop-bg: rgba(190, 18, 60, 0.92);
+  --zest-stop-border: rgba(244, 63, 94, 0.55);
+  --zest-stop-fg: #ffffff;
+  --zest-chip-ok-bg: rgba(16, 185, 129, 0.12);
+  --zest-chip-ok-fg: #047857;
+  --zest-chip-warn-bg: rgba(245, 158, 11, 0.12);
+  --zest-chip-warn-fg: #b45309;
+  --zest-chip-err-bg: rgba(244, 63, 94, 0.1);
+  --zest-chip-err-fg: #be123c;
+  --zest-chip-idle-bg: rgba(100, 116, 139, 0.1);
+  --zest-chip-idle-fg: #64748b;
+  --zest-chip-info-bg: rgba(77, 107, 254, 0.1);
+  --zest-chip-info-fg: #3352d8;
+  --zest-accept-tint: rgba(16, 185, 129, 0.16);
+  --zest-reject-tint: rgba(244, 63, 94, 0.14);
+  --zest-dock-danger-bg: rgba(190, 18, 60, 0.92);
+  --zest-dock-running: rgba(16, 185, 129, 0.22);
+  --zest-dock-idle: rgba(16, 24, 40, 0.06);
+  --zest-dock-border: rgba(16, 24, 40, 0.1);
+  --zest-progress-track: rgb(16 24 40 / 0.12);
+  --zest-particle-ink: #1a2433;
+  background-color: #f5f7fb;
+}
+
+[data-theme="seeker-blue"] body {
+  background-color: #f5f7fb;
+}
+
+/* Material: light card, hairline border, calm shadow; DS radius tokens. */
+[data-theme="seeker-blue"] .glass {
+  border: 0.5px solid rgb(16 24 40 / 0.08);
+  background-color: rgb(255 255 255 / 0.82);
+  box-shadow: 0 12px 40px rgb(23 43 99 / 0.1);
+  border-radius: var(--zest-radius-card, 1rem);
+}
+
+/* Light scrim behind dialogs (beats framer-motion inline background). */
+[data-theme="seeker-blue"] .zest-dialog-overlay {
+  background-color: rgb(15 23 42 / 0.32) !important;
+}
+
+/* Dialogs/panels ride on .glass but take the panel radius (specificity 0,3,0). */
+[data-theme="seeker-blue"] .glass.zest-dialog-content {
+  border-radius: var(--zest-radius-panel, 1rem);
+}
+
+/* Small glass controls that opted into rounded-xl keep the control radius
+   (.glass outranks plain utilities in source order — see styles.css .glass). */
+[data-theme="seeker-blue"] .glass.rounded-xl {
+  border-radius: var(--zest-radius-control, 0.75rem);
+}
+
+/* Collaboration + canvas suites read as one card: toolbar + page/surface. */
+[data-theme="seeker-blue"] .zest-collaboration-toolbar,
+[data-theme="seeker-blue"] .zest-canvas-toolbar {
+  border-radius: var(--zest-radius-card, 1rem) var(--zest-radius-card, 1rem) 0 0;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-page,
+[data-theme="seeker-blue"] .zest-canvas-surface-wrap {
+  border-radius: 0 0 var(--zest-radius-card, 1rem) var(--zest-radius-card, 1rem);
+}
+
+/* Suite controls (tool buttons, triggers, popovers, pickers). */
+[data-theme="seeker-blue"] .zest-collaboration-tools button,
+[data-theme="seeker-blue"] .zest-canvas-tools button,
+[data-theme="seeker-blue"] .zest-canvas-color-trigger,
+[data-theme="seeker-blue"] .zest-collaboration-link-popover,
+[data-theme="seeker-blue"] .zest-canvas-color-value > div {
+  border-radius: var(--zest-radius-control, 0.75rem);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-preview {
+  border-radius: var(--zest-radius-card, 1rem);
+}
+
+/* ---- Utility remaps: dark palette → light ink/surfaces (seeker-blue only) ---- */
+[data-theme="seeker-blue"] .text-sky-50,
+[data-theme="seeker-blue"] .text-slate-100,
+[data-theme="seeker-blue"] .text-gray-100,
+[data-theme="seeker-blue"] .text-white { color: #1a2433; }
+
+[data-theme="seeker-blue"] .text-sky-100 { color: rgb(26 36 51 / 0.78); }
+[data-theme="seeker-blue"] .text-sky-100\/35 { color: rgb(26 36 51 / 0.4); }
+[data-theme="seeker-blue"] .text-sky-100\/40 { color: rgb(26 36 51 / 0.45); }
+[data-theme="seeker-blue"] .text-sky-100\/45 { color: rgb(26 36 51 / 0.5); }
+[data-theme="seeker-blue"] .text-sky-100\/50 { color: rgb(26 36 51 / 0.55); }
+[data-theme="seeker-blue"] .text-sky-100\/55 { color: rgb(26 36 51 / 0.6); }
+[data-theme="seeker-blue"] .text-sky-100\/60 { color: rgb(26 36 51 / 0.65); }
+[data-theme="seeker-blue"] .text-sky-100\/65 { color: rgb(26 36 51 / 0.7); }
+[data-theme="seeker-blue"] .text-sky-100\/70 { color: rgb(26 36 51 / 0.75); }
+[data-theme="seeker-blue"] .text-sky-100\/75 { color: rgb(26 36 51 / 0.8); }
+[data-theme="seeker-blue"] .text-sky-100\/80 { color: rgb(26 36 51 / 0.85); }
+[data-theme="seeker-blue"] .text-sky-100\/85 { color: rgb(26 36 51 / 0.88); }
+[data-theme="seeker-blue"] .text-sky-50\/80 { color: rgb(26 36 51 / 0.85); }
+[data-theme="seeker-blue"] .text-sky-50\/85 { color: rgb(26 36 51 / 0.9); }
+[data-theme="seeker-blue"] .text-sky-200 { color: rgb(38 48 67 / 0.68); }
+[data-theme="seeker-blue"] .text-sky-200\/55 { color: rgb(38 48 67 / 0.6); }
+[data-theme="seeker-blue"] .text-sky-200\/65 { color: rgb(38 48 67 / 0.68); }
+[data-theme="seeker-blue"] .text-sky-200\/70 { color: rgb(38 48 67 / 0.72); }
+[data-theme="seeker-blue"] .text-sky-300 { color: #4263eb; }
+[data-theme="seeker-blue"] .text-slate-400 { color: rgb(71 85 105); }
+[data-theme="seeker-blue"] .text-slate-400\/60 { color: rgb(71 85 105 / 0.6); }
+[data-theme="seeker-blue"] .text-white\/75 { color: rgb(26 36 51 / 0.78); }
+[data-theme="seeker-blue"] .text-white\/95 { color: rgb(26 36 51 / 0.92); }
+[data-theme="seeker-blue"] .text-emerald-300 { color: #059669; }
+[data-theme="seeker-blue"] .text-rose-300 { color: #e11d48; }
+[data-theme="seeker-blue"] .text-rose-300\/80 { color: rgb(225 29 72 / 0.85); }
+[data-theme="seeker-blue"] .text-rose-200 { color: rgb(225 29 72 / 0.8); }
+[data-theme="seeker-blue"] .text-rose-200\/70 { color: rgb(225 29 72 / 0.75); }
+[data-theme="seeker-blue"] .text-amber-100\/75 { color: rgb(146 64 14 / 0.8); }
+[data-theme="seeker-blue"] .placeholder\:text-sky-100\/35::placeholder { color: rgb(38 48 67 / 0.45); }
+
+[data-theme="seeker-blue"] .hover\:text-white:hover { color: #1a2433; }
+[data-theme="seeker-blue"] .hover\:text-sky-50:hover { color: #101a28; }
+[data-theme="seeker-blue"] .hover\:text-sky-100:hover { color: rgb(26 36 51 / 0.9); }
+[data-theme="seeker-blue"] .hover\:text-rose-100:hover { color: #be123c; }
+
+[data-theme="seeker-blue"] .bg-black { background-color: rgb(16 24 40 / 0.04); }
+[data-theme="seeker-blue"] .bg-black\/15 { background-color: rgb(16 24 40 / 0.04); }
+[data-theme="seeker-blue"] .bg-black\/20 { background-color: rgb(16 24 40 / 0.05); }
+[data-theme="seeker-blue"] .bg-black\/25 { background-color: rgb(16 24 40 / 0.06); }
+[data-theme="seeker-blue"] .bg-black\/30 { background-color: rgb(16 24 40 / 0.07); }
+[data-theme="seeker-blue"] .bg-black\/35 { background-color: rgb(16 24 40 / 0.08); }
+[data-theme="seeker-blue"] .focus\:bg-black\/30:focus { background-color: rgb(16 24 40 / 0.07); }
+[data-theme="seeker-blue"] .hover\:bg-black:hover { background-color: rgb(16 24 40 / 0.05); }
+[data-theme="seeker-blue"] .hover\:bg-black\/25:hover { background-color: rgb(16 24 40 / 0.06); }
+[data-theme="seeker-blue"] .bg-white\/10 { background-color: rgb(16 24 40 / 0.05); }
+[data-theme="seeker-blue"] .bg-white\/\[0\.07\] { background-color: rgb(16 24 40 / 0.04); }
+[data-theme="seeker-blue"] .hover\:bg-white:hover { background-color: rgb(16 24 40 / 0.05); }
+[data-theme="seeker-blue"] .hover\:bg-white\/10:hover { background-color: rgb(16 24 40 / 0.06); }
+[data-theme="seeker-blue"] .hover\:bg-white\/\[0\.04\]:hover { background-color: rgb(16 24 40 / 0.04); }
+[data-theme="seeker-blue"] .hover\:bg-white\/\[0\.05\]:hover { background-color: rgb(16 24 40 / 0.05); }
+[data-theme="seeker-blue"] .hover\:bg-white\/\[0\.1\]:hover { background-color: rgb(16 24 40 / 0.06); }
+[data-theme="seeker-blue"] .bg-sky-100 { background-color: rgb(77 107 254 / 0.1); }
+[data-theme="seeker-blue"] .bg-sky-100\/45 { background-color: rgb(77 107 254 / 0.09); }
+[data-theme="seeker-blue"] .bg-sky-100\/80 { background-color: rgb(77 107 254 / 0.16); }
+[data-theme="seeker-blue"] .bg-sky-200 { background-color: rgb(77 107 254 / 0.12); }
+[data-theme="seeker-blue"] .bg-sky-200\/10 { background-color: rgb(77 107 254 / 0.05); }
+[data-theme="seeker-blue"] .bg-emerald-300 { background-color: #10b981; }
+[data-theme="seeker-blue"] .bg-rose-500\/10 { background-color: rgb(244 63 94 / 0.1); }
+[data-theme="seeker-blue"] .hover\:bg-rose-500:hover { background-color: #e11d48; }
+[data-theme="seeker-blue"] .hover\:bg-rose-500\/20:hover { background-color: rgb(225 29 72 / 0.16); }
+[data-theme="seeker-blue"] .bg-red-500\/65 { background-color: rgb(190 18 60 / 0.88); }
+
+[data-theme="seeker-blue"] .border-white\/10,
+[data-theme="seeker-blue"] .border-white\/\[0\.1\] { border-color: rgb(16 24 40 / 0.1); }
+[data-theme="seeker-blue"] .hover\:border-white\/\[0\.1\]:hover { border-color: rgb(16 24 40 / 0.18); }
+[data-theme="seeker-blue"] .divide-white\/10 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(16 24 40 / 0.08); }
+[data-theme="seeker-blue"] .border-sky-100 { border-color: rgb(77 107 254 / 0.22); }
+[data-theme="seeker-blue"] .border-sky-100\/20 { border-color: rgb(77 107 254 / 0.18); }
+[data-theme="seeker-blue"] .border-sky-100\/70 { border-color: rgb(77 107 254 / 0.5); }
+[data-theme="seeker-blue"] .border-sky-200 { border-color: rgb(77 107 254 / 0.3); }
+[data-theme="seeker-blue"] .border-sky-200\/25 { border-color: rgb(77 107 254 / 0.25); }
+[data-theme="seeker-blue"] .hover\:border-sky-100\/45:hover { border-color: rgb(77 107 254 / 0.45); }
+[data-theme="seeker-blue"] .focus\:border-sky-100\/35:focus { border-color: rgb(77 107 254 / 0.4); }
+[data-theme="seeker-blue"] .border-rose-300 { border-color: rgb(225 29 72 / 0.45); }
+[data-theme="seeker-blue"] .border-rose-300\/25 { border-color: rgb(225 29 72 / 0.35); }
+[data-theme="seeker-blue"] .border-amber-200\/15 { border-color: rgb(180 83 9 / 0.3); }
+
+[data-theme="seeker-blue"] .ring-sky-100 { --tw-ring-color: rgb(77 107 254 / 0.5); }
+[data-theme="seeker-blue"] .ring-sky-100\/60 { --tw-ring-color: rgb(77 107 254 / 0.45); }
+[data-theme="seeker-blue"] .ring-sky-100\/70 { --tw-ring-color: rgb(77 107 254 / 0.5); }
+[data-theme="seeker-blue"] .focus-visible\:ring-sky-100\/60:focus-visible { --tw-ring-color: rgb(77 107 254 / 0.45); }
+[data-theme="seeker-blue"] .focus-visible\:ring-sky-100\/70:focus-visible { --tw-ring-color: rgb(77 107 254 / 0.5); }
+[data-theme="seeker-blue"] .ring-rose-200 { --tw-ring-color: rgb(225 29 72 / 0.5); }
+[data-theme="seeker-blue"] .focus-visible\:ring-rose-200\/60:focus-visible { --tw-ring-color: rgb(225 29 72 / 0.45); }
+[data-theme="seeker-blue"] .accent-sky-300,
+[data-theme="seeker-blue"] .accent-sky-200 { accent-color: #4d6bfe; }
+
+/* ---- Collaboration & canvas suites: light surfaces ---- */
+[data-theme="seeker-blue"] .zest-collaboration-toolbar,
+[data-theme="seeker-blue"] .zest-canvas-toolbar {
+  border-color: rgb(16 24 40 / 0.1);
+  background: rgb(255 255 255 / 0.6);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-tool,
+[data-theme="seeker-blue"] .zest-canvas-tool {
+  color: rgb(38 48 67 / 0.65);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-tool:hover:not(:disabled):not(.zest-collaboration-tool-active),
+[data-theme="seeker-blue"] .zest-canvas-tool:hover:not(.zest-canvas-tool-active),
+[data-theme="seeker-blue"] .zest-canvas-color-trigger:hover,
+[data-theme="seeker-blue"] .zest-canvas-zoom-value:hover {
+  background: rgb(16 24 40 / 0.05);
+  color: #1a2433;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-tool-active {
+  background: color-mix(in srgb, var(--zest-collaboration-accent) 14%, transparent);
+  color: #2c4bd0;
+}
+
+[data-theme="seeker-blue"] .zest-canvas-tool-active {
+  background: color-mix(in srgb, var(--zest-canvas-accent) 14%, transparent);
+  color: #2c4bd0;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-divider,
+[data-theme="seeker-blue"] .zest-canvas-divider {
+  background: rgb(16 24 40 / 0.12);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-link-popover {
+  border-color: rgb(16 24 40 / 0.1);
+  background: rgb(255 255 255 / 0.97);
+  box-shadow: 0 18px 48px rgb(23 43 99 / 0.12);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-link-popover input {
+  border-color: rgb(16 24 40 / 0.12);
+  background: rgb(16 24 40 / 0.03);
+  color: #1a2433;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-link-popover button {
+  background: color-mix(in srgb, var(--zest-collaboration-accent) 14%, white);
+  color: #2a46c4;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-page,
+[data-theme="seeker-blue"] .zest-canvas-surface-wrap,
+[data-theme="seeker-blue"] .zest-canvas-surface {
+  border-color: rgb(16 24 40 / 0.1);
+  background: rgb(255 255 255 / 0.5);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor {
+  color: rgb(26 36 51 / 0.92);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor h1,
+[data-theme="seeker-blue"] .zest-collaboration-editor h2,
+[data-theme="seeker-blue"] .zest-collaboration-editor h3 {
+  color: #16202e;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor blockquote {
+  color: rgb(51 65 85 / 0.75);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor code {
+  border-color: rgb(16 24 40 / 0.08);
+  background: rgb(16 24 40 / 0.04);
+  color: #2e4fa3;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor pre {
+  border-color: rgb(16 24 40 / 0.08);
+  background: rgb(16 24 40 / 0.03);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-editor p.is-editor-empty:first-child::before {
+  color: rgb(38 48 67 / 0.35);
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-caret-label {
+  background: color-mix(in srgb, var(--zest-collaboration-accent) 14%, transparent);
+  color: #2a44c8;
+}
+
+[data-theme="seeker-blue"] .zest-collaboration-footer {
+  color: rgb(38 48 67 / 0.5);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-trigger {
+  color: rgb(38 48 67 / 0.7);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-current-color {
+  border-color: rgb(16 24 40 / 0.35);
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.5);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-zoom-value {
+  color: rgb(38 48 67 / 0.6);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-empty {
+  color: rgb(38 48 67 / 0.4);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-preview {
+  border-color: rgb(16 24 40 / 0.15);
+  box-shadow: 0 0 0 0.45rem rgb(16 24 40 / 0.06);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-value > label {
+  color: rgb(38 48 67 / 0.55);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-value > div {
+  border-color: rgb(16 24 40 / 0.1);
+  background: rgb(16 24 40 / 0.03);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-value input[type="text"],
+[data-theme="seeker-blue"] .zest-canvas-color-value input:not([type]) {
+  color: #1a2433;
+}
+
+[data-theme="seeker-blue"] .zest-canvas-native-color {
+  border-left-color: rgb(16 24 40 / 0.1);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-native-color span {
+  border-color: rgb(16 24 40 / 0.3);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-presets button {
+  outline-color: rgb(16 24 40 / 0.12);
+}
+
+[data-theme="seeker-blue"] .zest-canvas-color-presets button:hover,
+[data-theme="seeker-blue"] .zest-canvas-color-presets .zest-canvas-preset-active {
+  outline-color: rgb(26 36 51 / 0.8);
+}
+
+/* Progressive enhancement: DS squircle corners where supported. */
+@supports (corner-shape: superellipse(1.5)) {
+  [data-theme="seeker-blue"] .glass,
+  [data-theme="seeker-blue"] .zest-collaboration-toolbar,
+  [data-theme="seeker-blue"] .zest-collaboration-page,
+  [data-theme="seeker-blue"] .zest-canvas-toolbar,
+  [data-theme="seeker-blue"] .zest-canvas-surface-wrap {
+    corner-shape: superellipse(1.5);
+  }
+}

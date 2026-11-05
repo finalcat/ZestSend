@@ -439,7 +439,7 @@ function ConnectionCodeInput({
                   initial={false}
                   style={{
                     backgroundImage:
-                      "linear-gradient(90deg, #6ee7b7 0%, #6ee7b7 50%, rgba(224, 242, 254, 0.48) 50%, rgba(224, 242, 254, 0.48) 100%)",
+                      "linear-gradient(90deg, #6ee7b7 0%, #6ee7b7 50%, var(--zest-progress-track) 50%, var(--zest-progress-track) 100%)",
                   }}
                   transition={{
                     type: "spring",
@@ -457,7 +457,7 @@ function ConnectionCodeInput({
                   initial={false}
                   style={{
                     backgroundImage:
-                      "linear-gradient(90deg, #6ee7b7 0%, #6ee7b7 50%, rgba(224, 242, 254, 0.48) 50%, rgba(224, 242, 254, 0.48) 100%)",
+                      "linear-gradient(90deg, #6ee7b7 0%, #6ee7b7 50%, var(--zest-progress-track) 50%, var(--zest-progress-track) 100%)",
                   }}
                   transition={{
                     type: "spring",
@@ -889,6 +889,8 @@ function DiagnosticsDialog({
 
 export default function Home({ locale = "en" }: { locale?: HomeLocale }) {
   const copy = homeCopy[locale];
+  const { theme } = useTheme();
+  const particleColor = theme.scheme === "light" ? "#1a2433" : "#d9f4ff";
   const morphActivities = useMemo(() => shuffled(copy.activities), [copy.activities]);
   const [isAboutDialogOpen, setAboutDialogOpen] = useState(false);
   const [isLanguageDialogOpen, setLanguageDialogOpen] = useState(false);
@@ -936,7 +938,7 @@ export default function Home({ locale = "en" }: { locale?: HomeLocale }) {
             particleSize={1}
             fontSize={180}
             fontFamily="Aptos Display, Segoe UI, sans-serif"
-            color="#d9f4ff"
+            color={particleColor}
             className="h-full !min-h-0"
           />
         </div>

@@ -7,8 +7,10 @@ module.exports = {
   darkMode: "class",
   theme: {
     extend: {
-      animation: {
-        "pulse-slow": "pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+      borderRadius: {
+        xl: "var(--zest-radius-control, 0.75rem)",
+        "2xl": "var(--zest-radius-card, 1rem)",
+        "3xl": "var(--zest-radius-panel, 1.5rem)",
       },
     },
   },
