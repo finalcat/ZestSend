@@ -965,18 +965,15 @@ function ChatDeliveryStatus({ status }: { status: NonNullable<ChatMessage["deliv
         : RiLoader4Line;
   const color = status === "error" ? "text-rose-300/80" : status === "read" ? "text-sky-100/70" : "text-sky-100/60";
 
+  // No AutoTransition here on purpose: its AnimatePresence mode="wait" gates
+  // the icon swap on the old icon's exit animation, which is rAF-driven and
+  // never completes in a background tab — the sender's tab is usually hidden
+  // while the peer reads, so the read receipt would stay stuck on the old
+  // glyph until refocus. Render directly so the status is correct regardless
+  // of tab visibility; the spinner keeps its CSS animation.
   return (
-    <span className="relative inline-flex size-3.5 shrink-0 items-center justify-center self-center">
-      <AutoTransition
-        as="span"
-        className="absolute inset-0 grid place-items-center"
-        duration={0.2}
-        presenceMode="wait"
-        transitionKey={status}
-        type="fade"
-      >
-        <Icon aria-hidden="true" className={`size-3.5 ${status === "sending" ? "animate-spin" : ""} ${color}`} />
-      </AutoTransition>
+    <span className={`relative inline-flex size-3.5 shrink-0 items-center justify-center self-center ${color}`}>
+      <Icon aria-hidden="true" className={`size-3.5 ${status === "sending" ? "animate-spin" : ""}`} />
     </span>
   );
 }
