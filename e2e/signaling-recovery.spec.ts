@@ -99,7 +99,9 @@ async function sendChat(page: Page, text: string) {
   const composer = await openChat(page);
   await composer.fill(text);
   await composer.press("Enter");
-  await expect(page.getByText(text, { exact: true })).toBeVisible();
+  // .first(): the same text may be sent more than once by resend-tolerant
+  // helpers (e.g. the createPair barrier), which would trip strict mode.
+  await expect(page.getByText(text, { exact: true }).first()).toBeVisible();
 }
 
 function observeFrames(page: Page, frames: string[]) {
@@ -224,14 +226,16 @@ async function createPair(
     // visitors can queue messages), which no longer implies the P2P data
     // channels are open. A round-trip message is the barrier that guarantees a
     // live peer transport before any interruption scenario begins. The first
-    // minutes of a session can still run a short restart-peer renegotiation
-    // (resume choreography); resend with fresh text until one delivers.
-    let barrierAttempt = 0;
-    await expect.poll(async () => {
-      barrierAttempt++;
-      await sendChat(alice, `pair-ready-ping-${barrierAttempt}`);
-      return bob.getByText(`pair-ready-ping-${barrierAttempt}`, { exact: true }).isVisible().catch(() => false);
-    }, { timeout: 45_000, intervals: [2_500, 2_500, 2_500, 2_500, 2_500, 2_500, 5_000] }).toBe(true);
+    // moments of a session can still run a short restart-peer renegotiation;
+    // when the wait times out, resend the SAME text and keep waiting on that
+    // fixed locator — switching detection targets per attempt would race the
+    // asynchronous delivery and never observe it.
+    const barrierText = "pair-ready-ping";
+    const barrierOnBob = bob.getByText(barrierText, { exact: true }).first();
+    await expect(async () => {
+      await sendChat(alice, barrierText);
+      await expect(barrierOnBob).toBeVisible({ timeout: 4_000 });
+    }).toPass({ timeout: 45_000 });
     return { alice, aliceContext, aliceFrames, aliceSession, bob, bobContext, bobFrames, bobSession };
   } catch (error) {
     try {
@@ -316,6 +320,22 @@ test.describe("signaling-only interruptions", () => {
       await expect(pair.alice.getByText("chat-after-refresh", { exact: true })).toBeVisible();
       await sendChat(pair.alice, "reply-after-refresh");
       await expect(pair.bob.getByText("reply-after-refresh", { exact: true })).toBeVisible();
+    } catch (error) {
+      try {
+        const { writeFile } = await import("node:fs/promises");
+        const logs = await dumpTransportLogs([
+          { name: "alice", page: pair.alice },
+          { name: "bob", page: pair.bob },
+        ]);
+        await writeFile("e2e-interruption-diagnostics.json", `${JSON.stringify({
+          aliceFrames: pair.aliceFrames,
+          bobFrames: pair.bobFrames,
+          ...logs,
+        }, null, 2)}\n`, "utf8");
+      } catch {
+        // Diagnostics are best-effort; never mask the original failure.
+      }
+      throw error;
     } finally {
       await pair.aliceContext.close();
       await pair.bobContext.close();
