@@ -114,7 +114,10 @@ async function installProbe(page: Page, uploads: UploadRecord[]) {
 function observeImageApi(page: Page, network: NetworkRecord[]) {
   page.on("response", (response) => {
     const path = new URL(response.url()).pathname;
-    if (path.includes("/chat-images")) network.push({ path, method: response.request().method(), status: response.status() });
+    // Vite serves /src/client/lib/chat-images.ts in development; it is not an image API read.
+    if (path.startsWith("/api/chat-images/") || /^\/api\/rooms\/\d{4}\/chat-images$/.test(path)) {
+      network.push({ path, method: response.request().method(), status: response.status() });
+    }
   });
 }
 

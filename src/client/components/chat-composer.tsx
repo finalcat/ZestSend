@@ -6,7 +6,8 @@ import {
 import StarterKit from "@tiptap/starter-kit";
 import { RiImageAddLine, RiSendPlane2Fill, RiCloseLine } from "@remixicon/react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CHAT_TEXT_MAX_LENGTH, type ChatBlock } from "../../shared/chat-protocol";
+import { CHAT_TEXT_MAX_LENGTH, type ChatBlock, type ChatReply } from "../../shared/chat-protocol";
+import { ChatReplyCard } from "./chat-reply-card";
 import {
   ChatImageError, disposePreparedChatImage, prepareChatImage, validateChatImageFiles,
   type PreparedChatImage,
@@ -29,9 +30,10 @@ export type ChatComposerState = {
   images: PreparedChatImage[];
   pendingImages: PendingChatImage[];
   original: boolean;
+  reply?: ChatReply;
 };
 
-export type ChatComposerSubmit = { blocks: ChatBlock[]; images: PreparedChatImage[] };
+export type ChatComposerSubmit = { blocks: ChatBlock[]; images: PreparedChatImage[]; reply?: ChatReply };
 
 export type ChatComposerProps = {
   locale: "en" | "zh";
@@ -262,7 +264,7 @@ export function ChatComposer(props: ChatComposerProps) {
     const images = ids.map((id) => current.images.find((image) => image.id === id));
     if (images.some((image) => !image) || new Set(ids).size !== ids.length) return;
     try {
-      if (!callbacks.current.onSend({ blocks, images: images as PreparedChatImage[] })) return;
+      if (!callbacks.current.onSend({ blocks, images: images as PreparedChatImage[], ...(current.reply ? { reply: current.reply } : {}) })) return;
       disposeChatComposerState(current);
       commit(createEmptyChatComposerState());
       editorRef.current.commands.clearContent();
@@ -289,6 +291,12 @@ export function ChatComposer(props: ChatComposerProps) {
     } } });
     if (JSON.stringify(editor.getJSON()) !== JSON.stringify(props.state.content)) editor.commands.setContent(props.state.content, { emitUpdate: false });
   }, [editor, props.state.content, props.locale]);
+
+  // Selecting a reply changes only its snapshot, keeping the editor document,
+  // selection, image processing jobs and existing draft previews intact.
+  useEffect(() => {
+    if (props.state.reply && editor && !editor.isDestroyed) editor.commands.focus();
+  }, [editor, props.state.reply]);
 
   useEffect(() => {
     const pending = props.state.pendingImages;
@@ -339,6 +347,16 @@ export function ChatComposer(props: ChatComposerProps) {
   const canSend = props.ready && !props.state.pendingImages.length && hasContent;
   return (
     <div data-chat-composer="" className="relative flex max-h-[300px] min-h-[112px] w-full flex-col rounded-2xl border border-white/10 bg-black/25 text-[var(--zest-ink-strong)] focus-within:border-sky-100/35">
+      {props.state.reply ? <div className="shrink-0 px-3 pt-3"><ChatReplyCard
+        locale={props.locale}
+        onCancel={() => {
+          const { reply: _reply, ...draft } = latest.current;
+          commit(draft);
+          editorRef.current?.commands.focus();
+        }}
+        reply={props.state.reply}
+        replySender="local"
+      /></div> : null}
       <div className="relative min-h-0 flex-1 overflow-y-auto">
         {!hasContent ? <span aria-hidden="true" className="pointer-events-none absolute left-4 top-3 text-sm text-[var(--zest-ink-muted)]">{zh ? "输入消息" : "Write a message"}</span> : null}
         <EditorContent editor={editor} />

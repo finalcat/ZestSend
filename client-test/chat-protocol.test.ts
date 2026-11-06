@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHAT_MESSAGE_MAX_BYTES, isCloudChatImage, isInteractiveMessage, isRichChatMessage, type CloudChatImage, type RichChatMessage } from "../src/shared/chat-protocol";
+import { CHAT_MESSAGE_MAX_BYTES, createChatReply, getChatReplyAuthor, isChatReply, isChatCapabilitiesMessage, isChatReplyCapabilitiesMessage, isCloudChatImage, isInteractiveMessage, isRichChatMessage, type CloudChatImage, type RichChatMessage } from "../src/shared/chat-protocol";
 
 function image(index = 1): CloudChatImage {
   const expiresAt = 1_794_027_600_000;
@@ -89,5 +89,68 @@ describe("versioned rich chat protocol", () => {
     expect(new TextEncoder().encode(JSON.stringify(oversized)).byteLength).toBeGreaterThan(CHAT_MESSAGE_MAX_BYTES);
     expect(isRichChatMessage(oversized)).toBe(false);
     expect(isRichChatMessage({ type: "chat-rich", version: 1, id: "empty", blocks: [{ type: "paragraph", text: " " }], images: [] })).toBe(false);
+  });
+});
+
+describe("message reply snapshots", () => {
+  const reply = { messageId: "original", author: "recipient" as const, text: "Quoted text", imageCount: 0 };
+
+  it("accepts v2 text and image replies without modifying legacy formats", () => {
+    expect(isInteractiveMessage({ ...rich(), version: 2, reply })).toBe(true);
+    expect(isInteractiveMessage({ type: "chat-rich", version: 2, id: "text-reply", blocks: [{ type: "paragraph", text: "Answer" }], images: [], reply })).toBe(true);
+    expect(isInteractiveMessage({ ...rich(), reply })).toBe(false);
+    expect(isInteractiveMessage({ type: "chat", id: "legacy", text: "answer", reply })).toBe(false);
+    expect(isInteractiveMessage({ ...rich(), version: 2 })).toBe(false);
+    expect(isInteractiveMessage({ type: "chat-rich", version: 2, id: "empty", blocks: [{ type: "paragraph", text: " " }], images: [], reply })).toBe(false);
+  });
+
+  it("bounds Unicode snapshots and rejects nested quotes, credentials and malformed fields", () => {
+    expect(isChatReply({ ...reply, text: "😀".repeat(200) })).toBe(true);
+    expect(isChatReply({ ...reply, text: "😀".repeat(201) })).toBe(false);
+    expect(isChatReply({ ...reply, text: "", imageCount: 10 })).toBe(true);
+    for (const change of [
+      { messageId: "" }, { messageId: "x".repeat(129) }, { author: "local" },
+      { imageCount: -1 }, { imageCount: 11 }, { imageCount: 0.5 }, { imageCount: NaN },
+      { text: " " }, { text: null }, { readToken: "secret" }, { reply }, { src: "https://example.com" },
+    ]) {
+      expect(isChatReply({ ...reply, ...change })).toBe(false);
+      expect(isInteractiveMessage({ ...rich(), version: 2, reply: { ...reply, ...change } })).toBe(false);
+    }
+  });
+
+  it("copies only the target body once and truncates by Unicode codepoint", () => {
+    const target = { id: "original", sender: "remote" as const, text: "ignored", blocks: [
+      { type: "paragraph" as const, text: "  " + "😀".repeat(201) },
+      { type: "image" as const, imageId: image().imageId },
+    ], images: [image()], reply };
+    const snapshot = createChatReply(target);
+    target.blocks[0].text = "Changed later";
+    expect(snapshot).toEqual({ messageId: "original", author: "recipient", text: "😀".repeat(200), imageCount: 1 });
+    expect(Object.keys(snapshot).sort()).toEqual(["author", "imageCount", "messageId", "text"]);
+    expect(createChatReply({ id: "own", sender: "local", text: "body" })).toEqual({ messageId: "own", author: "sender", text: "body", imageCount: 0 });
+    expect(createChatReply({ id: "picture", sender: "remote", text: "", blocks: [{ type: "image", imageId: image().imageId }] })).toMatchObject({ text: "", imageCount: 1 });
+  });
+
+  it("translates author for both viewers and keeps image and reply declarations separate", () => {
+    expect(getChatReplyAuthor(reply, "local")).toBe("remote");
+    expect(getChatReplyAuthor(reply, "remote")).toBe("local");
+    expect(getChatReplyAuthor({ ...reply, author: "sender" }, "local")).toBe("local");
+    expect(getChatReplyAuthor({ ...reply, author: "sender" }, "remote")).toBe("remote");
+    const images = { type: "chat-capabilities", version: 1, richImages: true };
+    const replies = { type: "chat-reply-capabilities", version: 1, replies: true };
+    expect(isChatCapabilitiesMessage(images)).toBe(true);
+    expect(isChatReplyCapabilitiesMessage(replies)).toBe(true);
+    expect(isChatCapabilitiesMessage(replies)).toBe(false);
+    expect(isChatCapabilitiesMessage({ ...images, replies: true })).toBe(false);
+    expect(isChatReplyCapabilitiesMessage({ ...replies, replies: false })).toBe(false);
+    expect(isChatReplyCapabilitiesMessage({ ...replies, version: 2 })).toBe(false);
+  });
+
+  it("includes the reply in the total wire budget", () => {
+    const message = { ...rich(), version: 2, reply, blocks: [
+      ...Array.from({ length: 2_200 }, () => ({ type: "paragraph", text: "" })),
+      { type: "image", imageId: rich().images[0].imageId },
+    ] };
+    expect(isRichChatMessage(message)).toBe(false);
   });
 });

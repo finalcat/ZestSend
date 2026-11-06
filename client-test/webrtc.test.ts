@@ -204,6 +204,114 @@ function openChannel(peer: FakePeer, name: string): FakeChannel {
   return channel;
 }
 
+function replyMessage(withImage = false): RichChatMessage {
+  return { ...richMessage(), version: 2,
+    blocks: withImage ? richMessage().blocks : [{ type: "paragraph", text: "Reply body" }],
+    images: withImage ? richMessage().images : [],
+    reply: { messageId: "original", author: "recipient", text: "Original body", imageCount: 0 },
+  };
+}
+
+describe("reply capability compatibility", () => {
+  it("negotiates separately from image support and accepts late declarations", async () => {
+    const { session } = start(true);
+    const listener = vi.fn();
+    const unsubscribe = session.subscribeChatReplySupport(listener);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    expect(control.send).toHaveBeenCalledWith(JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }));
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.chatImageSupport).toBe("supported");
+    expect(session.chatReplySupport).toBe("unknown");
+    expect(session.sendRichChatMessage(replyMessage())).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(session.chatReplySupport).toBe("unsupported");
+    expect(session.chatImageSupport).toBe("supported");
+    expect(session.sendChatMessage("legacy", "still works")).toBe(true);
+    expect(session.sendRichChatMessage(richMessage())).toBe(true);
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    expect(session.sendRichChatMessage(replyMessage())).toBe(true);
+    expect(interactive.send).toHaveBeenCalledWith(JSON.stringify(replyMessage()));
+    const count = control.send.mock.calls.length;
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    expect(control.send.mock.calls).toHaveLength(count);
+    expect(listener.mock.calls.map(([value]) => value)).toEqual(["unknown", "unsupported", "supported"]);
+    unsubscribe();
+  });
+
+  it("allows text replies without image support but gates attachments", () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    openChannel(peer, "interactive");
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    expect(session.chatImageSupport).toBe("unknown");
+    expect(session.sendRichChatMessage(replyMessage())).toBe(true);
+    expect(session.sendRichChatMessage(replyMessage(true))).toBe(false);
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.sendRichChatMessage(replyMessage(true))).toBe(true);
+  });
+
+  it("learns from incoming v2 messages and preserves duplicate receipts", () => {
+    const { session, onMessage } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    const data = JSON.stringify(replyMessage());
+    interactive.onmessage?.({ data });
+    interactive.onmessage?.({ data });
+    expect(session.chatReplySupport).toBe("supported");
+    expect(session.chatImageSupport).toBe("unknown");
+    expect(onMessage).toHaveBeenCalledExactlyOnceWith(replyMessage());
+    expect(control.send.mock.calls.filter(([payload]) => typeof payload === "string" && JSON.parse(payload).type === "chat-received")).toHaveLength(2);
+  });
+
+  it("ignores old channel callbacks and deadlines after peer replacement or suspend", async () => {
+    const { session, socket } = start(true);
+    const control = openChannel(FakePeer.instances[0], "control");
+    const oldReceive = control.onmessage;
+    negotiate(socket, 2, "remote-2", true);
+    oldReceive?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(session.chatReplySupport).toBe("unknown");
+    const next = openChannel(FakePeer.instances[1], "control");
+    next.onmessage?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(session.chatReplySupport).toBe("supported");
+    session.suspend();
+    expect(session.chatReplySupport).toBe("unknown");
+    expect(session.sendRichChatMessage(replyMessage())).toBe(false);
+  });
+
+  it.each(["suspend", "replace"] as const)("revokes channels before reentrant capability listeners during %s", (operation) => {
+    const { session, socket } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-reply-capabilities", version: 1, replies: true }) });
+    const originalReply = replyMessage();
+    expect(session.sendRichChatMessage(originalReply)).toBe(true);
+    // Room resumes all unacknowledged messages from either capability listener.
+    // Subscribing calls the listeners once, before the teardown under test.
+    const resume = vi.fn(() => {
+      session.sendChatMessage("unacknowledged-text", "Pending text");
+      session.sendRichChatMessage(originalReply);
+    });
+    session.subscribeChatImageSupport(resume);
+    session.subscribeChatReplySupport(resume);
+    const sendsBeforeTeardown = interactive.send.mock.calls.length;
+    resume.mockClear();
+    if (operation === "suspend") session.suspend();
+    else negotiate(socket, 2, "remote-2", true);
+    expect(resume).toHaveBeenCalled();
+    expect(interactive.readyState).toBe("closed");
+    expect(interactive.send.mock.calls).toHaveLength(sendsBeforeTeardown);
+    expect(session.chatReplySupport).toBe("unknown");
+  });
+});
+
 describe("rich chat compatibility and upload authorization", () => {
   it("announces capabilities on control open before the other channels are available", async () => {
     const { session } = start(true);

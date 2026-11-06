@@ -24,16 +24,53 @@ export type CloudChatImage = {
   original: boolean;
 };
 
+export const CHAT_REPLY_MAX_LENGTH = 200;
+export type ChatReply = {
+  messageId: string;
+  /** Author of the original message, relative to the sender of this reply. */
+  author: "sender" | "recipient";
+  text: string;
+  imageCount: number;
+};
+
+/** Copy only the target body, never its own quote or image credentials. */
+export function createChatReply(message: {
+  id: string; sender: "local" | "remote"; text: string; blocks?: ChatBlock[];
+}): ChatReply {
+  const text = message.blocks
+    ? message.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n")
+    : message.text;
+  return {
+    messageId: message.id,
+    author: message.sender === "local" ? "sender" : "recipient",
+    text: Array.from(text.trim()).slice(0, CHAT_REPLY_MAX_LENGTH).join(""),
+    imageCount: message.blocks?.filter((block) => block.type === "image").length ?? 0,
+  };
+}
+
+export function getChatReplyAuthor(reply: ChatReply, replySender: "local" | "remote"): "local" | "remote" {
+  return reply.author === "sender" ? replySender : replySender === "local" ? "remote" : "local";
+}
+
+export function isChatReply(value: unknown): value is ChatReply {
+  return record(value) && exactKeys(value, ["messageId", "author", "text", "imageCount"])
+    && messageId(value.messageId) && (value.author === "sender" || value.author === "recipient")
+    && typeof value.text === "string" && Array.from(value.text).length <= CHAT_REPLY_MAX_LENGTH
+    && Number.isInteger(value.imageCount) && (value.imageCount as number) >= 0 && (value.imageCount as number) <= CHAT_IMAGE_MAX_COUNT
+    && (value.text.trim().length > 0 || (value.imageCount as number) > 0);
+}
+
 export type LegacyChatMessage = { type: "chat"; id: string; text: string };
 export type RichChatMessage = {
   type: "chat-rich";
-  version: 1;
   id: string;
   blocks: ChatBlock[];
   images: CloudChatImage[];
-};
+} & ({ version: 1 } | { version: 2; reply: ChatReply });
 export type InteractiveMessage = LegacyChatMessage | RichChatMessage;
 export type ChatImageSupport = "unknown" | "supported" | "unsupported";
+export type ChatReplySupport = ChatImageSupport;
+export type ChatReplyCapabilitiesMessage = { type: "chat-reply-capabilities"; version: 1; replies: true };
 export type ChatCapabilitiesMessage = { type: "chat-capabilities"; version: 1; richImages: true };
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -71,8 +108,9 @@ export function isCloudChatImage(value: unknown): value is CloudChatImage {
 }
 
 export function isRichChatMessage(value: unknown): value is RichChatMessage {
-  if (!record(value) || !exactKeys(value, ["type", "version", "id", "blocks", "images"])
-    || value.type !== "chat-rich" || value.version !== 1 || !messageId(value.id)
+  if (!record(value) || !exactKeys(value, value.version === 2 ? ["type", "version", "id", "blocks", "images", "reply"] : ["type", "version", "id", "blocks", "images"])
+    || value.type !== "chat-rich" || (value.version !== 1 && value.version !== 2) || !messageId(value.id)
+    || (value.version === 2 && !isChatReply(value.reply))
     || !Array.isArray(value.blocks) || value.blocks.length === 0
     || !Array.isArray(value.images) || value.images.length > CHAT_IMAGE_MAX_COUNT || !boundedWireSize(value)) return false;
   const images = new Set<string>();
@@ -113,4 +151,9 @@ export function isInteractiveMessage(value: unknown): value is InteractiveMessag
 export function isChatCapabilitiesMessage(value: unknown): value is ChatCapabilitiesMessage {
   return record(value) && exactKeys(value, ["type", "version", "richImages"])
     && value.type === "chat-capabilities" && value.version === 1 && value.richImages === true;
+}
+
+export function isChatReplyCapabilitiesMessage(value: unknown): value is ChatReplyCapabilitiesMessage {
+  return record(value) && exactKeys(value, ["type", "version", "replies"])
+    && value.type === "chat-reply-capabilities" && value.version === 1 && value.replies === true;
 }

@@ -39,6 +39,7 @@ import {
   RiPauseLine,
   RiPlayLine,
   RiRefreshLine,
+  RiReplyLine,
   RiShareForwardLine,
   RiRouterLine,
   RiSignalCellular1Fill,
@@ -72,9 +73,10 @@ import * as Y from "yjs";
 import Layout from "../components/Layout";
 import { ChatComposer, createEmptyChatComposerState, disposeChatComposerState, type ChatComposerState, type ChatComposerSubmit } from "../components/chat-composer";
 import { ChatImageMessage, type LocalChatImagePreview } from "../components/chat-image-message";
+import { ChatReplyCard } from "../components/chat-reply-card";
 import { ChatImageAssetStore, ChatImageUploadQueue, ChatImageRequestError, chatImageErrorText } from "../lib/chat-image-client";
 import type { PreparedChatImage } from "../lib/chat-images";
-import type { ChatBlock, CloudChatImage, RichChatMessage } from "../../shared/chat-protocol";
+import { createChatReply, type ChatReply, type ChatBlock, type CloudChatImage, type RichChatMessage } from "../../shared/chat-protocol";
 import { CollaborationCanvas } from "../components/collaboration-canvas";
 import { CollaborationWorkspace } from "../components/collaboration-editor";
 import { useTheme } from "../components/theme";
@@ -113,6 +115,7 @@ type ChatMessage = {
   images?: CloudChatImage[];
   localImages?: LocalChatImagePreview[];
   rich?: RichChatMessage;
+  reply?: ChatReply;
   uploadState?: "waiting" | "uploading" | "complete" | "error";
   uploadCount?: number;
   imageError?: string;
@@ -125,6 +128,7 @@ type ChatController = {
   onStateChange: (state: ChatComposerState) => void;
   onSend: (draft: ChatComposerSubmit) => boolean;
   onRetry: (id: string) => void;
+  onReply: (id: string) => void;
   imageStore: ChatImageAssetStore;
   assetVersion: number;
   error: string | null;
@@ -175,7 +179,7 @@ function WorkspaceShell({
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
-      <OverlayScrollbar className={workspaceScrollClassName} reverse={reverse} syncKey={scrollKey}>
+      <OverlayScrollbar className={workspaceScrollClassName} data-workspace-scroll="" reverse={reverse} syncKey={scrollKey}>
         {children}
       </OverlayScrollbar>
       {banner}
@@ -942,6 +946,42 @@ function ChatWorkspace({
   const [visibleCount, setVisibleCount] = useState(CHAT_RENDER_LIMIT);
   const messageListRef = useRef<HTMLDivElement>(null);
   const readMessageIdsRef = useRef(new Set<string>());
+  const [replyTarget, setReplyTarget] = useState<{ id: string; request: number } | null>(null);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [replyNotice, setReplyNotice] = useState<string | null>(null);
+
+  const locateReply = (id: string) => {
+    const index = messages.findIndex((message) => message.id === id);
+    if (index < 0) {
+      setReplyNotice(locale === "zh" ? "原消息不在当前聊天记录中" : "The original message is not in this chat history.");
+      return;
+    }
+    setReplyNotice(null);
+    setVisibleCount((count) => Math.max(count, messages.length - index));
+    setReplyTarget((current) => ({ id, request: (current?.request ?? 0) + 1 }));
+  };
+
+  useEffect(() => {
+    if (!replyTarget) return;
+    let timer: number | undefined;
+    const frame = window.requestAnimationFrame(() => {
+      const list = messageListRef.current;
+      const element = Array.from(list?.querySelectorAll<HTMLElement>("[data-chat-entry-id]") ?? [])
+        .find((entry) => entry.dataset.chatEntryId === replyTarget.id);
+      const viewport = list?.closest<HTMLElement>("[data-overlayscrollbars-viewport]") ?? list?.closest<HTMLElement>("[data-workspace-scroll]");
+      if (!element || !viewport) return;
+      const bounds = element.getBoundingClientRect();
+      const visibleBounds = viewport.getBoundingClientRect();
+      viewport.scrollBy({ top: bounds.top - visibleBounds.top - (viewport.clientHeight - bounds.height) / 2,
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+      setHighlightedId(replyTarget.id);
+      timer = window.setTimeout(() => setHighlightedId(null), 1_800);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [replyTarget]);
 
   // The message list renders bottom-up inside a column-reverse scroller:
   // scrollTop 0 is the newest message, so the browser pins to the bottom
@@ -972,7 +1012,7 @@ function ChatWorkspace({
 
   return (
     <WorkspaceShell
-      banner={<>{banner}{controller.error ? <p className="mb-2 text-xs text-rose-300" role="alert">{controller.error}</p> : null}</>}
+      banner={<>{banner}{replyNotice ? <p className="mb-2 text-xs opacity-70" role="status">{replyNotice}</p> : null}{controller.error ? <p className="mb-2 text-xs text-rose-300" role="alert">{controller.error}</p> : null}</>}
       composerAutoSize
       footer={<ChatComposer accent={accent} locale={locale} onSend={controller.onSend} onStateChange={controller.onStateChange} onTyping={onTyping} ready={ready} state={controller.state} />}
       status={(
@@ -1000,7 +1040,9 @@ function ChatWorkspace({
                   <motion.div key={message.id} layout="position" transition={{ duration: 0.2, ease: "easeOut" }}>
                     <motion.div
                       animate={{ opacity: 1, y: 0 }}
-                      className={`mb-5 flex flex-col ${isLocal ? "items-end" : "items-start"}`}
+                      className={`group mb-5 flex flex-col rounded-xl ${highlightedId === message.id ? "ring-2 ring-sky-400/70" : ""} ${isLocal ? "items-end" : "items-start"}`}
+                      data-chat-entry-id={message.id}
+                      data-chat-highlighted={highlightedId === message.id ? "true" : undefined}
                       data-chat-message-id={isLocal ? undefined : message.id}
                       data-chat-kind={message.blocks ? "rich" : "text"}
                       exit={{ opacity: 0, y: -6 }}
@@ -1014,6 +1056,7 @@ function ChatWorkspace({
                             ? { backgroundColor: `${accent}40`, color: "var(--zest-ink-strong)" }
                             : { backgroundColor: "var(--zest-bubble-remote-bg)", color: "var(--zest-bubble-remote-fg)" }}
                         >
+                          {message.reply ? <div className="mb-2"><ChatReplyCard reply={message.reply} replySender={message.sender} locale={locale} onClick={() => locateReply(message.reply!.messageId)} /></div> : null}
                           {message.blocks ? <ChatImageMessage blocks={message.blocks} images={message.images} localImages={message.localImages} locale={locale} store={controller.imageStore} /> : message.text}
                         </div>
                         <svg
@@ -1034,6 +1077,11 @@ function ChatWorkspace({
                           {new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(message.sentAt)}
                         </time>
                         {isLocal ? <ChatDeliveryStatus status={message.deliveryStatus ?? "sending"} /> : null}
+                        {(!isLocal || ((message.deliveryStatus === "sending" || message.deliveryStatus === "received" || message.deliveryStatus === "read") && (!message.uploadState || message.uploadState === "complete"))) ? (
+                          <button aria-label={locale === "zh" ? "回复" : "Reply"} className="ml-1 inline-flex items-center rounded px-1.5 py-1 opacity-100 hover:bg-white/10 focus-visible:opacity-100 focus-visible:outline focus-visible:outline-1 [@media(hover:hover)_and_(pointer:fine)]:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100" data-chat-reply="" onClick={() => controller.onReply(message.id)} type="button">
+                            <RiReplyLine aria-hidden="true" className="size-3.5" />
+                          </button>
+                        ) : null}
                       </p>
                     </motion.div>
                   </motion.div>
@@ -3186,7 +3234,11 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "图片已过期，请重新选择图片发送。" : "Images expired. Choose them again to send a new copy." } : item));
       return;
     }
-    if (message.rich && session.chatImageSupport !== "supported") {
+    if (message.reply && session.chatReplySupport !== "supported") {
+      if (session.chatReplySupport === "unsupported") updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "对方版本不支持引用回复，请让对方刷新页面后重试。" : "The other participant needs to refresh before receiving replies." } : item));
+      return;
+    }
+    if (message.rich?.images.length && session.chatImageSupport !== "supported") {
       if (session.chatImageSupport === "unsupported") updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "对方版本不支持图文消息，请让对方刷新页面后重试。" : "The other participant needs to refresh before receiving images." } : item));
       return;
     }
@@ -3227,7 +3279,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       const failed = attempts.find((attempt) => attempt.status === "rejected");
       if (failed?.status === "rejected") throw failed.reason;
       const rich: RichChatMessage = {
-        id, type: "chat-rich", version: 1,
+        id, type: "chat-rich", ...(pending.draft.reply ? { version: 2 as const, reply: pending.draft.reply } : { version: 1 as const }),
         blocks: pending.draft.blocks.map((block) => block.type === "image" ? { type: "image", imageId: pending.uploaded.get(block.imageId)!.imageId } : block),
         images: pending.draft.images.map((image) => pending.uploaded.get(image.id)!),
       };
@@ -3653,7 +3705,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           sender: "remote",
           sentAt: Date.now(),
           text: message.type === "chat" ? message.text : message.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n"),
-          ...(message.type === "chat-rich" ? { blocks: message.blocks, images: message.images, rich: message } : {}),
+          ...(message.type === "chat-rich" ? { blocks: message.blocks, images: message.images, rich: message, ...(message.version === 2 ? { reply: message.reply } : {}) } : {}),
         }));
       },
       (id, status) => {
@@ -3729,6 +3781,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     );
     sessionRef.current = session;
     const unsubscribeChatCapabilities = session.subscribeChatImageSupport(() => resumeChatMessages(session));
+    const unsubscribeReplyCapabilities = session.subscribeChatReplySupport(() => resumeChatMessages(session));
     connectionReportedRef.current = false;
     replaceCollaborationProvider(session);
     setMediaTransport(session.media);
@@ -3766,6 +3819,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       else session.close();
       unsubscribeMedia();
       unsubscribeChatCapabilities();
+      unsubscribeReplyCapabilities();
       rawMicrophoneTrackRef.current?.stop();
       rawMicrophoneTrackRef.current = null;
       cameraTrackRef.current?.stop();
@@ -3864,11 +3918,21 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     } };
   };
 
+  const replyToChatMessage = (id: string): void => {
+    const message = chatMessagesRef.current.find((item) => item.id === id);
+    if (!message || (message.sender === "local" && (message.deliveryStatus === "queued" || message.deliveryStatus === "error" || (message.uploadState && message.uploadState !== "complete")))) return;
+    changeChatComposerState({ ...chatComposerStateRef.current, reply: createChatReply(message) });
+  };
+
   const sendChatMessage = (draft: ChatComposerSubmit): boolean => {
     const text = draft.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n");
     if (!text.trim() && !draft.images.length) return false;
     if (text.length > 4_000) { setChatComposerError(locale === "zh" ? "消息文字不能超过 4,000 字符。" : "Messages can contain up to 4,000 text characters."); return false; }
     const session = sessionRef.current;
+    if (draft.reply && session?.chatReplySupport === "unsupported") {
+      setChatComposerError(locale === "zh" ? "对方版本不支持引用回复，请让对方刷新页面。" : "The other participant needs to refresh before receiving replies.");
+      return false;
+    }
     if (draft.images.length && session?.chatImageSupport === "unsupported") {
       setChatComposerError(locale === "zh" ? "对方版本不支持图文消息，请让对方刷新页面。" : "The other participant needs to refresh before receiving images.");
       return false;
@@ -3879,8 +3943,13 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       // The editor releases its preview URLs when accepted; the room owns copies.
       const previews = draft.images.map((image) => ({ id: image.id, url: URL.createObjectURL(image.file), width: image.width, height: image.height, name: image.file.name }));
       pendingChatUploadsRef.current.set(id, { draft, previews, uploaded: new Map(), running: false });
-      updateChatMessages((current) => appendChatMessage(current, { id, text, blocks: draft.blocks, localImages: previews, sender: "local", sentAt: Date.now(), deliveryStatus: "queued", uploadState: "waiting", uploadCount: 0 }));
+      updateChatMessages((current) => appendChatMessage(current, { id, text, blocks: draft.blocks, reply: draft.reply, localImages: previews, sender: "local", sentAt: Date.now(), deliveryStatus: "queued", uploadState: "waiting", uploadCount: 0 }));
       void processChatUpload(id);
+    } else if (draft.reply) {
+      const rich: RichChatMessage = { id, type: "chat-rich", version: 2, blocks: draft.blocks, images: [], reply: draft.reply };
+      updateChatMessages((current) => appendChatMessage(current, { id, text, blocks: rich.blocks, images: [], rich, reply: draft.reply, sender: "local", sentAt: Date.now(), deliveryStatus: "queued" }));
+      const message = chatMessagesRef.current.find((item) => item.id === id);
+      if (message && session) tryDeliverChatMessage(session, message);
     } else {
       const delivered = session?.sendChatMessage(id, text.trim()) ?? false;
       updateChatMessages((current) => appendChatMessage(current, { id, text: text.trim(), sender: "local", sentAt: Date.now(), deliveryStatus: delivered ? "sending" : "queued", ...(delivered ? { lastAttemptedAt: Date.now() } : {}) }));
@@ -4335,7 +4404,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           microphonePending={microphonePending}
           noiseReductionActive={noiseReductionActive}
           onMarkChatMessageRead={markChatMessageRead}
-          chatController={{ state: chatComposerState, onStateChange: changeChatComposerState, onSend: sendChatMessage, onRetry: retryChatMessage, imageStore: chatImageStoreRef.current!, assetVersion: chatAssetVersion, error: chatComposerError }}
+          chatController={{ state: chatComposerState, onStateChange: changeChatComposerState, onSend: sendChatMessage, onRetry: retryChatMessage, onReply: replyToChatMessage, imageStore: chatImageStoreRef.current!, assetVersion: chatAssetVersion, error: chatComposerError }}
           onToggleNoiseReduction={toggleNoiseReduction}
           onSelectMicrophone={selectMicrophone}
           onToggleMicrophone={toggleMicrophone}

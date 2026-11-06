@@ -48,14 +48,17 @@ import {
   CHAT_MESSAGE_MAX_BYTES,
   CHAT_TEXT_MAX_LENGTH,
   isChatCapabilitiesMessage,
+  isChatReplyCapabilitiesMessage,
   isInteractiveMessage,
   isRichChatMessage,
   type ChatCapabilitiesMessage,
+  type ChatReplyCapabilitiesMessage,
+  type ChatReplySupport,
   type ChatImageSupport,
   type InteractiveMessage,
   type RichChatMessage,
 } from "../../shared/chat-protocol";
-export type { ChatImageSupport, InteractiveMessage, RichChatMessage } from "../../shared/chat-protocol";
+export type { ChatReplySupport, ChatImageSupport, InteractiveMessage, RichChatMessage } from "../../shared/chat-protocol";
 import {
   ROOM_DISCONNECTED_LEASE_MS,
   SIGNALING_HEARTBEAT_CAPABILITY,
@@ -110,7 +113,7 @@ type ChatTypingMessage = {
   type: "chat-typing";
 };
 
-type DataChannelControlMessage = DataChannelPingMessage | ChatReceiptMessage | ChatTypingMessage | ChatCapabilitiesMessage | MediaSlotControlMessage | SharedPlaybackMessage;
+type DataChannelControlMessage = DataChannelPingMessage | ChatReceiptMessage | ChatTypingMessage | ChatCapabilitiesMessage | ChatReplyCapabilitiesMessage | MediaSlotControlMessage | SharedPlaybackMessage;
 
 type DataChannelName = "bulk" | "collaboration" | "control" | "interactive";
 
@@ -588,6 +591,9 @@ export class NativeWebRTCSession {
   private channels: Record<DataChannelName, RTCDataChannel | null> = { bulk: null, collaboration: null, control: null, interactive: null };
   private collaborationListeners = new Set<(data: ArrayBuffer) => void>();
   private collaborationStatusListeners = new Set<(ready: boolean) => void>();
+  private chatReplySupportListeners = new Set<(support: ChatReplySupport) => void>();
+  private chatReplySupportState: ChatReplySupport = "unknown";
+  private chatReplySupportTimer: number | undefined;
   private chatImageSupportListeners = new Set<(support: ChatImageSupport) => void>();
   private chatImageSupportState: ChatImageSupport = "unknown";
   private chatImageSupportTimer: number | undefined;
@@ -870,6 +876,14 @@ export class NativeWebRTCSession {
     return () => this.collaborationStatusListeners.delete(listener);
   }
 
+  get chatReplySupport(): ChatReplySupport { return this.chatReplySupportState; }
+
+  subscribeChatReplySupport(listener: (support: ChatReplySupport) => void): () => void {
+    this.chatReplySupportListeners.add(listener);
+    listener(this.chatReplySupportState);
+    return () => this.chatReplySupportListeners.delete(listener);
+  }
+
   get chatImageSupport(): ChatImageSupport { return this.chatImageSupportState; }
 
   subscribeChatImageSupport(listener: (support: ChatImageSupport) => void): () => void {
@@ -918,8 +932,18 @@ export class NativeWebRTCSession {
   }
 
   sendRichChatMessage(message: RichChatMessage): boolean {
-    if (this.chatImageSupportState !== "supported" || !isRichChatMessage(message)) return false;
+    if (!isRichChatMessage(message)
+      || (message.images.length > 0 && this.chatImageSupportState !== "supported")
+      || (message.version === 2 && this.chatReplySupportState !== "supported")) return false;
     return this.sendOnChannel("interactive", JSON.stringify(message));
+  }
+
+  private setChatReplySupport(support: ChatReplySupport): void {
+    if (this.chatReplySupportTimer !== undefined) window.clearTimeout(this.chatReplySupportTimer);
+    this.chatReplySupportTimer = undefined;
+    if (this.chatReplySupportState === support) return;
+    this.chatReplySupportState = support;
+    for (const listener of this.chatReplySupportListeners) listener(support);
   }
 
   private setChatImageSupport(support: ChatImageSupport): void {
@@ -932,6 +956,12 @@ export class NativeWebRTCSession {
 
   private announceChatCapabilities(channel: RTCDataChannel): void {
     this.sendDataChannelControl({ type: "chat-capabilities", version: 1, richImages: true });
+    this.sendDataChannelControl({ type: "chat-reply-capabilities", version: 1, replies: true });
+    if (this.chatReplySupportState === "unknown") {
+      this.chatReplySupportTimer = window.setTimeout(() => {
+        if (this.channels.control === channel && !this.closed && !this.suspended) this.setChatReplySupport("unsupported");
+      }, 2_000);
+    }
     if (this.chatImageSupportState !== "unknown") return;
     this.chatImageSupportTimer = window.setTimeout(() => {
       if (this.channels.control === channel && !this.closed && !this.suspended) this.setChatImageSupport("unsupported");
@@ -1540,7 +1570,10 @@ export class NativeWebRTCSession {
       previous.onerror = null;
       try { previous.close(); } catch { /* already closed */ }
     }
-    if (name === "control" && previous !== channel) this.setChatImageSupport("unknown");
+    if (name === "control" && previous !== channel) {
+      this.setChatImageSupport("unknown");
+      this.setChatReplySupport("unknown");
+    }
     this.channels[name] = channel; channel.binaryType = "arraybuffer"; this.updateDataChannelProgress();
     channel.onopen = () => {
       if (this.channels[name] !== channel || this.closed || this.suspended) return;
@@ -1759,6 +1792,12 @@ export class NativeWebRTCSession {
     if (typeof data !== "string") return;
     let message: DataChannelControlMessage;
     try { message = JSON.parse(data) as DataChannelControlMessage; } catch { return; }
+    if (isChatReplyCapabilitiesMessage(message)) {
+      const newlySupported = this.chatReplySupportState !== "supported";
+      this.setChatReplySupport("supported");
+      if (newlySupported) this.sendDataChannelControl({ type: "chat-reply-capabilities", version: 1, replies: true });
+      return;
+    }
     if (isChatCapabilitiesMessage(message)) {
       const newlySupported = this.chatImageSupportState !== "supported";
       this.setChatImageSupport("supported");
@@ -1793,7 +1832,10 @@ export class NativeWebRTCSession {
     try {
       const message = JSON.parse(data) as unknown;
       if (!isInteractiveMessage(message)) return;
-      if (message.type === "chat-rich") this.setChatImageSupport("supported");
+      if (message.type === "chat-rich") {
+        if (message.images.length > 0 || message.version === 1) this.setChatImageSupport("supported");
+        if (message.version === 2) this.setChatReplySupport("supported");
+      }
       this.sendDataChannelControl({ id: message.id, type: "chat-received" });
       if (this.receivedChatIds.has(message.id)) return;
       this.receivedChatIds.add(message.id); this.onInteractiveMessage(message);
@@ -1831,14 +1873,22 @@ export class NativeWebRTCSession {
     const traffic = this.mediaTransport.traffic; return { received: this.receivedBytes + traffic.received, sent: this.sentBytes + traffic.sent };
   }
   private closeDataChannels(): void {
-    this.setChatImageSupport("unknown");
     const collaborationWasReady = this.collaborationReady;
-    for (const name of DATA_CHANNEL_NAMES) {
-      const channel = this.channels[name]; if (!channel) continue;
+    // Capability listeners can synchronously retry pending chat messages.
+    // Revoke every channel before notifying them, so teardown cannot send
+    // through a still-open channel owned by the previous peer.
+    const detachedChannels = DATA_CHANNEL_NAMES.map((name) => {
+      const channel = this.channels[name];
+      this.channels[name] = null;
+      return channel;
+    });
+    for (const channel of detachedChannels) {
+      if (!channel) continue;
       channel.onclose = null; channel.onerror = null; channel.onopen = null; channel.onmessage = null;
       try { channel.close(); } catch { /* already closed */ }
-      this.channels[name] = null;
     }
+    this.setChatImageSupport("unknown");
+    this.setChatReplySupport("unknown");
     if (collaborationWasReady) this.notifyCollaborationStatus(false);
   }
   private notifyCollaborationStatus(ready: boolean): void {

@@ -41,6 +41,7 @@ export default defineConfig({
   projects: [
     { name: "rich-chat-production", testMatch: "rich-chat.spec.ts", use: { ...devices["Desktop Chrome"] } },
     { name: "chat-interface-production", testMatch: "chat-interface.spec.ts", use: { ...devices["Desktop Chrome"] } },
+    { name: "chat-reply-production", testMatch: "chat-reply.spec.ts", use: { ...devices["Desktop Chrome"] } },
     {
       name: "signaling-production",
       testMatch: "signaling-recovery.spec.ts",
