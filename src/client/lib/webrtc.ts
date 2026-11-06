@@ -565,6 +565,30 @@ function v2Epoch(value: unknown): number | undefined {
 
 type V2Signal = SignalMessage & { from?: string; peerId?: string };
 
+type PeerTransaction = {
+  peer: RTCPeerConnection;
+  generation: number;
+  key: string;
+  phase: "offering" | "waiting-answer" | "answering" | "connecting" | "connected";
+  descriptions: RTCSessionDescriptionInit[];
+  candidates: RTCIceCandidateInit[];
+  receivedCandidates: Set<string>;
+  localCandidates: Map<string, RTCIceCandidateInit>;
+  sentCandidates: Set<string>;
+  sentEpoch: number;
+  offer?: RTCSessionDescriptionInit;
+  answer?: RTCSessionDescriptionInit;
+  remoteOfferSdp?: string;
+  appliedAnswerSdp?: string;
+  descriptionPending: boolean;
+  draining: Promise<void> | null;
+  timers: number[];
+  offerTimersStarted: boolean;
+  deadlineAt: number;
+};
+
+type PeerRecovery = { key: string; timer?: number; deadline?: number };
+
 /** WebRTC session with resumable signaling and peer renegotiation. */
 export class NativeWebRTCSession {
   private channels: Record<DataChannelName, RTCDataChannel | null> = { bulk: null, collaboration: null, control: null, interactive: null };
@@ -587,12 +611,12 @@ export class NativeWebRTCSession {
   private hasAdmittedSeat = false;
   private peer: RTCPeerConnection | null = null;
   private peerGeneration = 0;
-  private peerRestarting = false;
+  private transaction: PeerTransaction | null = null;
+  private negotiationReady = false;
+  private recovery: PeerRecovery | null = null;
+  private recoveryAttempt = 0;
   private connectedNotified = false;
   private pendingSignals: V2Signal[] = [];
-  private signalFlushPromise: Promise<void> | null = null;
-  private negotiationPromise: Promise<void> | null = null;
-  private offerRetryQueued = false;
   private remoteParticipantJoined = false;
   private remoteSignalingDisconnected = false;
   private remoteSlotId: string | null = null;
@@ -679,6 +703,9 @@ export class NativeWebRTCSession {
       state: "reconnecting",
     });
     this.clearReconnectTimer();
+    this.cancelPeerRecovery();
+    this.invalidateTransaction();
+    this.negotiationReady = false;
     this.stopHeartbeat();
     this.stopDataChannelLatencyProbe();
     this.socketGeneration += 1;
@@ -698,7 +725,6 @@ export class NativeWebRTCSession {
     this.peerLocalSlotId = null;
     this.peerLocalSessionId = null;
     this.pendingSignals = [];
-    this.peerRestarting = false;
     this.connectedNotified = false;
   }
 
@@ -733,6 +759,9 @@ export class NativeWebRTCSession {
     this.seatState = "unassigned";
     this.reportStatus({ p2pState: "disconnected", seatState: "unassigned", signalingState: "closed", state: "closed" });
     this.clearReconnectTimer();
+    this.cancelPeerRecovery();
+    this.invalidateTransaction();
+    this.negotiationReady = false;
     this.stopHeartbeat();
     this.stopDataChannelLatencyProbe();
     if (this.socket?.readyState === WebSocket.OPEN) {
@@ -745,6 +774,9 @@ export class NativeWebRTCSession {
 
   private finishClose(preserveResumeToken = false): void {
     const sessionResumeToken = this.resumeToken;
+    this.cancelPeerRecovery();
+    this.invalidateTransaction();
+    this.negotiationReady = false;
     this.clearReconnectTimer();
     this.clearSeatLeaseTimer();
     if (this.leaveAckTimer !== undefined) {
@@ -914,8 +946,7 @@ export class NativeWebRTCSession {
       if (this.closed || this.suspended) return;
       this.readyForPeerConnection = true;
       if (!this.remoteParticipantJoined) this.setStep("p2p", { state: "pending", detail: "Waiting for the other participant to join the room" });
-      await this.flushSignals();
-      if (this.remoteParticipantJoined && this.initiator && !this.peer) await this.createOffer();
+      this.coordinateNegotiation();
     })();
     return this.icePreparationPromise;
   }
@@ -997,7 +1028,7 @@ export class NativeWebRTCSession {
     let message: ServerMessage;
     try { message = JSON.parse(rawMessage) as ServerMessage; } catch { return; }
     if (message.type === "welcome") {
-      const oldEpoch = this.epoch;
+      const oldLocalIdentity = `${this.slotId}:${this.peerSessionId}`;
       const hadRemoteParticipant = this.remoteParticipantJoined;
       const p2pHealthy = this.isP2PHealthy();
       this.hasAdmittedSeat = true;
@@ -1008,7 +1039,7 @@ export class NativeWebRTCSession {
       this.peerSessionId = message.peerSessionId ?? this.peerSessionId;
       this.offererSlotId = message.offererSlotId ?? this.offererSlotId;
       const epoch = v2Epoch(message.epoch);
-      if (epoch !== undefined && epoch !== this.epoch) { this.epoch = epoch; this.pendingSignals = []; }
+      if (epoch !== undefined) this.epoch = Math.max(this.epoch, epoch);
       if (typeof message.resumeToken === "string" && message.resumeToken.length <= 512) {
         this.resumeToken = message.resumeToken; v2WriteResumeToken(this.roomId, message.resumeToken);
       }
@@ -1020,7 +1051,7 @@ export class NativeWebRTCSession {
       if (this.remoteParticipantJoined) this.remoteSeatState = "present";
       if (!this.remoteParticipantJoined) {
         this.remoteSignalingDisconnected = hadRemoteParticipant;
-        if (!p2pHealthy) {
+        if (!p2pHealthy && !this.transaction) {
           this.remoteSlotId = null;
           this.rememberedRemoteSlotId = null;
           this.remotePeerSessionId = null;
@@ -1029,7 +1060,7 @@ export class NativeWebRTCSession {
       } else {
         this.remoteSignalingDisconnected = false;
       }
-      if (this.socketMode === "restart-peer" && oldEpoch !== 0 && this.epoch !== oldEpoch) this.resetPeerForNegotiation();
+      if (oldLocalIdentity !== `${this.slotId}:${this.peerSessionId}` && this.transaction) this.resetPeerForNegotiation();
       this.reconnectAttempt = 0;
       this.setStep("websocket", { state: "active", detail: "Signaling socket connected" });
       this.reportStatus({
@@ -1044,18 +1075,11 @@ export class NativeWebRTCSession {
       // A full page refresh can resume the signaling lease without retaining
       // the old RTCPeerConnection. Ask the room to rotate the peer session so
       // both sides receive a fresh negotiate event.
-      if (message.resumed && message.peerCount > 1 && !this.peer && this.socketMode === "resume-signaling") {
-        this.peerRestarting = true;
-        this.openSocket("restart-peer");
+      if (message.resumed && message.peerCount > 1 && !this.peer && this.socketMode === "resume-signaling" && !this.recovery) {
+        this.requestPeerRestart();
         return;
       }
-      void this.flushSignals();
-      // A restart handshake is followed by a recipient-relative `negotiate`
-      // event. Waiting for it prevents an offer from the previous epoch from
-      // racing the fresh peer session.
-      if (this.socketMode !== "restart-peer" && this.remoteParticipantJoined && this.initiator && this.readyForPeerConnection && !this.peer) {
-        void this.createOffer();
-      }
+      this.coordinateNegotiation();
       return;
     }
     if (message.type === "pong") {
@@ -1068,13 +1092,16 @@ export class NativeWebRTCSession {
       this.remoteParticipantJoined = true;
       this.remoteSignalingDisconnected = false;
       this.remoteSeatState = "present";
-      if (message.type === "negotiate" && !this.isP2PHealthy() && this.peer) this.resetPeerForNegotiation();
+      if (message.type === "negotiate") {
+        if (this.recovery && this.recovery.key !== this.peerIdentityKey()) this.cancelPeerRecovery();
+        if (!this.recovery) this.negotiationReady = true;
+      }
       if (!this.isP2PHealthy()) this.reportStatus({ p2pState: this.currentP2PState(), remoteSeatState: "present", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
       if (!this.readyForPeerConnection) this.setStep("p2p", { state: "checking", detail: "Peer joined, preparing P2P connection" });
       // `peer-ready` is an admission hint. The worker follows it with a
       // recipient-relative `negotiate` event; waiting for that event avoids
       // creating an offer that is immediately invalidated by the new epoch.
-      if (message.type === "negotiate" && this.initiator && this.readyForPeerConnection && !this.peer) void this.createOffer();
+      this.coordinateNegotiation();
       return;
     }
     if (message.type === "peer-disconnected" || message.type === "peer-reconnected") {
@@ -1092,14 +1119,11 @@ export class NativeWebRTCSession {
         this.remoteParticipantJoined = true;
         this.remoteSignalingDisconnected = false;
         this.remoteSeatState = "present";
-        this.peerRestarting = false;
         this.reportStatus({ detail: "Signaling socket connected", remoteSeatState: "present", state: "connected" });
-        const peerNeedsReset = !this.isP2PHealthy();
-        if (this.peer && peerNeedsReset) this.resetPeerForNegotiation();
-        if (!this.peer && this.readyForPeerConnection) {
-          if (this.initiator) void this.createOffer();
-          else this.requestPeerRestart();
-        }
+        // A signaling resume alone does not authorize a second offer on the
+        // same PC. A refreshed document will request its own session rotation.
+        if (!this.peer && !this.recovery) this.requestPeerRestart();
+        else this.coordinateNegotiation();
       }
       return;
     }
@@ -1143,7 +1167,8 @@ export class NativeWebRTCSession {
       this.rememberedRemoteSlotId = null;
       this.remotePeerSessionId = null;
       this.stopDataChannelLatencyProbe(); this.closeDataChannels(); this.mediaTransport.detachPeer();
-      this.peer?.close(); this.peer = null; this.peerRestarting = false; this.connectedNotified = false;
+      this.cancelPeerRecovery(); this.invalidateTransaction(); this.negotiationReady = false;
+      this.peer?.close(); this.peer = null; this.connectedNotified = false;
       this.reportStatus({ detail: "Waiting for another participant", p2pState: "waiting", remoteSeatState: this.remoteSeatState, state: "connected" });
       this.setStep("p2p", { state: "pending", detail: "Waiting for the other participant to join the room" });
       this.setStep("dataChannel", { channels: 0, state: "pending", detail: "Waiting for data channel", transferred: this.dataTransfer() });
@@ -1182,7 +1207,7 @@ export class NativeWebRTCSession {
   private updateRemoteMetadata(message: { epoch?: number; peerId?: string; peerSessionId?: string; slotId?: string; offererSlotId?: string; peers?: Array<{ slotId?: string; peerSessionId?: string }> }): boolean {
     const epoch = v2Epoch(message.epoch);
     if (epoch !== undefined && this.epoch !== 0 && epoch < this.epoch) return false;
-    if (epoch !== undefined && epoch !== this.epoch) { this.epoch = epoch; this.pendingSignals = []; }
+    if (epoch !== undefined) this.epoch = Math.max(this.epoch, epoch);
     const announcedSlotId = message.slotId ?? message.peerId;
     const announcedPeerSessionId = message.peerSessionId;
     const peerFromList = message.peers?.find((peer) => peer.slotId && peer.slotId !== this.slotId);
@@ -1210,132 +1235,238 @@ export class NativeWebRTCSession {
   }
 
   private acceptSignal(signal: V2Signal): boolean {
+    if (signal.fromSlotId && this.remoteSlotId && signal.fromSlotId !== this.remoteSlotId) return false;
+    if (signal.peerSessionId && this.remotePeerSessionId && signal.peerSessionId !== this.remotePeerSessionId) return false;
     const epoch = v2Epoch(signal.epoch);
     if (epoch !== undefined && this.epoch !== 0 && epoch < this.epoch) return false;
     if (epoch !== undefined && epoch > this.epoch) {
       this.epoch = epoch;
-      this.pendingSignals = [];
     }
-    if (signal.fromSlotId && this.remoteSlotId && signal.fromSlotId !== this.remoteSlotId) return false;
-    if (signal.peerSessionId && this.remotePeerSessionId && signal.peerSessionId !== this.remotePeerSessionId) return false;
     if (epoch !== undefined && this.epoch === 0) this.epoch = epoch;
     if (signal.fromSlotId) this.remoteSlotId = signal.fromSlotId;
     if (signal.peerSessionId) this.remotePeerSessionId = signal.peerSessionId;
     return true;
   }
 
-  private async createOffer(): Promise<void> {
-    if (!this.readyForPeerConnection || !this.remoteParticipantJoined || !this.initiator || this.closed || this.suspended || this.peer) return;
-    if (this.negotiationPromise) {
-      if (!this.offerRetryQueued) {
-        this.offerRetryQueued = true;
-        const pending = this.negotiationPromise;
-        const retry = () => {
-          this.offerRetryQueued = false;
-          if (!this.closed && !this.suspended && this.remoteParticipantJoined && this.initiator && this.readyForPeerConnection && !this.peer) {
-            void this.createOffer();
-          }
-        };
-        void pending.then(retry, retry);
-      }
-      return;
-    }
-    this.negotiationPromise = this.performCreateOffer().finally(() => { this.negotiationPromise = null; });
-    await this.negotiationPromise;
+  private peerIdentityKey(): string {
+    return JSON.stringify([this.slotId, this.peerSessionId, this.remoteSlotId, this.remotePeerSessionId]);
   }
 
-  private async performCreateOffer(): Promise<void> {
-    let peer: RTCPeerConnection | null = null;
+  private ownsTransaction(tx: PeerTransaction): boolean {
+    return !this.closed && !this.suspended && this.transaction === tx
+      && this.peer === tx.peer && this.peerGeneration === tx.generation && tx.key === this.peerIdentityKey();
+  }
+
+  private invalidateTransaction(): void {
+    const tx = this.transaction;
+    this.transaction = null;
+    if (tx) for (const timer of tx.timers) window.clearTimeout(timer);
+    this.pendingSignals = [];
+  }
+
+  /** Every admission/ICE/metadata path converges here; only negotiate authorizes a PC. */
+  private coordinateNegotiation(): void {
+    if (this.recovery) this.schedulePeerRecovery(this.recovery);
+    if (this.closed || this.suspended || !this.readyForPeerConnection || !this.remoteParticipantJoined
+      || this.remoteSignalingDisconnected || this.signalingState !== "connected" || this.seatState !== "confirmed"
+      || !this.negotiationReady || this.recovery) return;
+    const tx = this.transaction;
+    if (tx) {
+      // The timeout may have elapsed while the other seat was absent. Check
+      // again when signaling makes recovery possible instead of losing it.
+      if (Date.now() >= tx.deadlineAt && !this.isP2PHealthy()) {
+        this.requestPeerRestart();
+        return;
+      }
+      this.flushOutgoingSignals(tx);
+      void this.flushSignals();
+    } else if (this.initiator) {
+      void this.createOffer();
+    } else {
+      void this.flushSignals();
+    }
+  }
+
+  private async createOffer(): Promise<void> {
+    if (this.transaction || this.peer || !this.negotiationReady || this.recovery || this.closed || this.suspended) return;
+    let tx: PeerTransaction | null = null;
     try {
-      this.reportStatus({ p2pState: "negotiating", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
-      peer = this.createPeerConnection();
-      const offerEpoch = this.epoch;
+      const peer = this.createPeerConnection();
+      tx = this.transaction!;
+      tx.phase = "offering";
       this.mediaTransport.prepareOffer(peer);
       for (const name of DATA_CHANNEL_NAMES) this.attachDataChannel(peer.createDataChannel(name, { ordered: name !== "bulk" }));
       this.setStep("p2p", { state: "checking", detail: "Creating P2P offer" });
       const offer = await peer.createOffer();
-      if (this.closed || this.suspended || this.peer !== peer || this.epoch !== offerEpoch) return;
+      if (!this.ownsTransaction(tx)) return;
       await peer.setLocalDescription(offer);
-      if (this.closed || this.suspended || this.peer !== peer || this.epoch !== offerEpoch) return;
-      this.sendSignal({ description: offer });
+      if (!this.ownsTransaction(tx)) return;
+      // Keep the original SDP stable even as localDescription gathers ICE.
+      tx.offer = { type: offer.type, sdp: offer.sdp };
+      tx.phase = "waiting-answer";
+      tx.descriptionPending = true;
+      this.flushOutgoingSignals(tx);
+      void this.flushSignals();
     } catch {
-      if (!this.closed && !this.suspended && (!peer || this.peer === peer)) this.requestPeerRestart();
+      if (!tx || this.ownsTransaction(tx)) this.requestPeerRestart();
     }
   }
 
   private createPeerConnection(): RTCPeerConnection {
-    if (this.remoteParticipantJoined) this.reportStatus({ p2pState: "negotiating", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
+    this.reportStatus({ p2pState: "negotiating", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
     const peer = new RTCPeerConnection({ iceServers: this.selectedServers });
     const generation = ++this.peerGeneration;
+    const tx: PeerTransaction = {
+      peer, generation, key: this.peerIdentityKey(), phase: this.initiator ? "offering" : "answering",
+      descriptions: [], candidates: [], receivedCandidates: new Set(), localCandidates: new Map(),
+      sentCandidates: new Set(), sentEpoch: -1, descriptionPending: false, draining: null,
+      timers: [], offerTimersStarted: false, deadlineAt: Date.now() + 30_000,
+    };
+    this.transaction = tx;
     this.peer = peer;
     this.peerLocalSlotId = this.slotId;
     this.peerLocalSessionId = this.peerSessionId;
-    peer.onicecandidate = ({ candidate }) => { if (candidate && this.peer === peer && generation === this.peerGeneration) this.sendSignal({ candidate: asCandidate(candidate) }); };
-    peer.ontrack = (event) => { if (this.peer === peer && generation === this.peerGeneration) this.mediaTransport.handleRemoteTrack(event); };
+    tx.timers.push(window.setTimeout(() => {
+      if (this.ownsTransaction(tx) && !this.isP2PHealthy()) this.requestPeerRestart();
+    }, 30_000));
+    peer.onicecandidate = ({ candidate }) => {
+      if (!candidate || !this.ownsTransaction(tx)) return;
+      const value = asCandidate(candidate);
+      tx.localCandidates.set(JSON.stringify(value), value);
+      this.flushOutgoingSignals(tx);
+    };
+    peer.ontrack = (event) => { if (this.ownsTransaction(tx)) this.mediaTransport.handleRemoteTrack(event); };
     peer.onconnectionstatechange = () => {
-      if (this.peer !== peer || generation !== this.peerGeneration || this.closed || this.suspended) return;
-      if (peer.connectionState === "failed") this.requestPeerRestart();
+      if (!this.ownsTransaction(tx)) return;
+      if (peer.connectionState === "failed") { this.requestPeerRestart(); return; }
       if (peer.connectionState === "connected") {
         this.setStep("p2p", { state: "active", detail: "P2P connection established" });
         this.reportStatus({ p2pState: this.currentP2PState(), state: this.isP2PHealthy() ? "connected" : "reconnecting" });
         void this.detectConnectionRoute(peer);
       }
-      if (peer.connectionState === "disconnected") this.reportStatus({ p2pState: "recovering", state: "reconnecting" });
+      if (peer.connectionState === "disconnected") {
+        this.reportStatus({ p2pState: "recovering", state: "reconnecting" });
+        // A transient disconnect may heal; unlike failed, allow ICE a grace period.
+        tx.timers.push(window.setTimeout(() => {
+          if (this.ownsTransaction(tx) && peer.connectionState === "disconnected") this.requestPeerRestart();
+        }, 5_000));
+      }
     };
-    peer.ondatachannel = ({ channel }) => { if (this.peer === peer && generation === this.peerGeneration) this.attachDataChannel(channel); };
+    peer.ondatachannel = ({ channel }) => { if (this.ownsTransaction(tx)) this.attachDataChannel(channel); };
     return peer;
   }
 
-  private async flushSignals(): Promise<void> {
-    if (!this.readyForPeerConnection || this.closed || this.suspended) return;
-    if (this.signalFlushPromise) return this.signalFlushPromise;
-    this.signalFlushPromise = this.flushSignalsInternal().finally(() => { this.signalFlushPromise = null; });
-    return this.signalFlushPromise;
+  private flushOutgoingSignals(tx: PeerTransaction): void {
+    if (!this.ownsTransaction(tx) || this.signalingState !== "connected" || this.seatState !== "confirmed") return;
+    if (tx.peer.connectionState === "failed" || tx.peer.connectionState === "closed") {
+      this.requestPeerRestart();
+      return;
+    }
+    if (tx.sentEpoch !== this.epoch) {
+      tx.sentEpoch = this.epoch;
+      tx.sentCandidates.clear();
+      if (tx.phase !== "connected") tx.descriptionPending = true;
+    }
+    const description = tx.answer ?? (tx.appliedAnswerSdp === undefined ? tx.offer : undefined);
+    if (tx.offer && !tx.offerTimersStarted) {
+      tx.offerTimersStarted = true;
+      for (const delay of [2_000, 6_000, 14_000]) {
+        tx.timers.push(window.setTimeout(() => {
+          if (!this.ownsTransaction(tx) || tx.appliedAnswerSdp !== undefined) return;
+          tx.descriptionPending = true;
+          this.flushOutgoingSignals(tx);
+        }, delay));
+      }
+    }
+    if (description && tx.descriptionPending && this.sendSignal({ description })) tx.descriptionPending = false;
+    // ICE is replayable independently of SDP, including across signaling epochs.
+    for (const [key, candidate] of tx.localCandidates) {
+      if (!tx.sentCandidates.has(key) && this.sendSignal({ candidate })) tx.sentCandidates.add(key);
+    }
   }
 
-  private async flushSignalsInternal(): Promise<void> {
-    while (this.pendingSignals.length && !this.closed && !this.suspended) {
-      const signal = this.pendingSignals.shift();
-      if (!signal?.payload) continue;
-      const { candidate, description } = signal.payload;
-      const signalEpoch = this.epoch;
-      try {
-        if (description) {
-          const peer = this.peer ?? this.createPeerConnection();
-          if (description.type === "offer" && peer.signalingState === "have-local-offer") await peer.setLocalDescription({ type: "rollback" });
-          if (this.closed || this.suspended || this.peer !== peer || this.epoch !== signalEpoch) return;
-          await peer.setRemoteDescription(description);
-          if (this.closed || this.suspended || this.peer !== peer || this.epoch !== signalEpoch) return;
+  private async flushSignals(): Promise<void> {
+    if (!this.readyForPeerConnection || !this.negotiationReady || this.closed || this.suspended || this.recovery) return;
+    if (!this.transaction) {
+      if (!this.pendingSignals.some((signal) => signal.payload?.description?.type === "offer")) return;
+      try { this.createPeerConnection(); } catch { this.requestPeerRestart(); return; }
+    }
+    const tx = this.transaction!;
+    for (const signal of this.pendingSignals.splice(0)) {
+      if ((signal.fromSlotId && signal.fromSlotId !== this.remoteSlotId)
+        || (signal.peerSessionId && signal.peerSessionId !== this.remotePeerSessionId)) continue;
+      const { description, candidate } = signal.payload ?? {};
+      if (description) tx.descriptions.push(description);
+      if (candidate) {
+        const key = JSON.stringify(candidate);
+        if (!tx.receivedCandidates.has(key)) {
+          tx.receivedCandidates.add(key);
+          tx.candidates.push(candidate);
+        }
+      }
+    }
+    if (tx.draining) return tx.draining;
+    // Lock before invoking the async worker. A new transaction owns a different
+    // lock, so a never-resolving old RTC operation cannot block the new offer.
+    tx.draining = Promise.resolve().then(() => this.flushSignalsInternal(tx)).finally(() => {
+      tx.draining = null;
+      if (this.ownsTransaction(tx) && (tx.descriptions.length
+        || (tx.peer.remoteDescription && tx.candidates.length) || this.pendingSignals.length)) void this.flushSignals();
+    });
+    return tx.draining;
+  }
+
+  private async flushSignalsInternal(tx: PeerTransaction): Promise<void> {
+    const peer = tx.peer;
+    while (this.ownsTransaction(tx)) {
+      const description = tx.descriptions.shift();
+      if (description) {
+        try {
           if (description.type === "offer") {
+            if (this.initiator) continue; // The room assigns exactly one offerer.
+            if (tx.remoteOfferSdp !== undefined) {
+              if (tx.remoteOfferSdp !== (description.sdp ?? "")) { this.requestPeerRestart(); return; }
+              tx.descriptionPending = true;
+              this.flushOutgoingSignals(tx);
+              continue;
+            }
+            tx.remoteOfferSdp = description.sdp ?? "";
+            tx.phase = "answering";
+            await peer.setRemoteDescription(description);
+            if (!this.ownsTransaction(tx)) return;
             this.mediaTransport.bindIncomingPeer(peer);
             this.setStep("p2p", { state: "checking", detail: "Accepting P2P offer" });
             const answer = await peer.createAnswer();
-            if (this.closed || this.suspended || this.peer !== peer || this.epoch !== signalEpoch) return;
+            if (!this.ownsTransaction(tx)) return;
             await peer.setLocalDescription(answer);
-            if (this.closed || this.suspended || this.peer !== peer || this.epoch !== signalEpoch) return;
-            this.sendSignal({ description: answer });
-          }
-        }
-        if (candidate) {
-          const peer = this.peer;
-          if (peer?.remoteDescription) {
-            await peer.addIceCandidate(candidate);
-            if (this.closed || this.suspended || this.peer !== peer || this.epoch !== signalEpoch) return;
-          }
-          else {
-            // Candidates can arrive before the offer. Keep them behind any
-            // queued description so one early candidate cannot block the
-            // whole signaling queue.
-            const hasQueuedDescription = this.pendingSignals.some((queued) => queued.payload?.description);
-            if (hasQueuedDescription) {
-              this.pendingSignals.push(signal);
+            if (!this.ownsTransaction(tx)) return;
+            tx.answer = { type: answer.type, sdp: answer.sdp };
+            tx.phase = "connecting";
+            tx.descriptionPending = true;
+            this.flushOutgoingSignals(tx);
+          } else if (description.type === "answer") {
+            if (!this.initiator || !tx.offer) continue;
+            if (tx.appliedAnswerSdp !== undefined) {
+              if (tx.appliedAnswerSdp !== (description.sdp ?? "")) this.requestPeerRestart();
               continue;
             }
-            this.pendingSignals.unshift(signal);
-            return;
+            await peer.setRemoteDescription(description);
+            if (!this.ownsTransaction(tx)) return;
+            tx.appliedAnswerSdp = description.sdp ?? "";
+            tx.descriptionPending = false;
+            tx.phase = "connecting";
           }
+        } catch {
+          if (this.ownsTransaction(tx)) this.requestPeerRestart();
+          return;
         }
-      } catch { if (!this.closed && !this.suspended) this.requestPeerRestart(); return; }
+        continue;
+      }
+      if (!peer.remoteDescription || !tx.candidates.length) return;
+      const candidate = tx.candidates.shift()!;
+      const ufrag = candidate.usernameFragment ?? /(?:^|\s)ufrag\s+(\S+)/.exec(candidate.candidate ?? "")?.[1];
+      if (ufrag && !peer.remoteDescription.sdp?.split(/\r?\n/).includes(`a=ice-ufrag:${ufrag}`)) continue;
+      try { await peer.addIceCandidate(candidate); } catch { /* A stale ICE candidate cannot invalidate an SDP transaction. */ }
     }
   }
 
@@ -1355,7 +1486,14 @@ export class NativeWebRTCSession {
       if (name === "collaboration") this.notifyCollaborationStatus(true);
       if (this.openDataChannelCount() === DATA_CHANNEL_COUNT && !this.connectedNotified) {
         this.connectedNotified = true;
-        this.peerRestarting = false;
+        this.recoveryAttempt = 0;
+        this.cancelPeerRecovery();
+        if (this.transaction) {
+          this.transaction.phase = "connected";
+          this.transaction.deadlineAt = Number.POSITIVE_INFINITY;
+          for (const timer of this.transaction.timers) window.clearTimeout(timer);
+          this.transaction.timers = [];
+        }
         this.reportStatus({ detail: "Peer-to-peer connection established", p2pState: "connected", state: "connected" });
         this.onConnected(this);
       }
@@ -1386,9 +1524,9 @@ export class NativeWebRTCSession {
 
   /** Clears the current peer transport while retaining local capture tracks and application state. */
   private resetPeerForNegotiation(): void {
+    this.negotiationReady = false;
+    this.invalidateTransaction();
     this.connectedNotified = false;
-    this.peerRestarting = false;
-    this.reportStatus({ p2pState: this.remoteParticipantJoined ? "negotiating" : "waiting", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
     this.stopDataChannelLatencyProbe();
     this.closeDataChannels();
     this.mediaTransport.detachPeer();
@@ -1397,28 +1535,46 @@ export class NativeWebRTCSession {
     this.peerLocalSlotId = null;
     this.peerLocalSessionId = null;
     peer?.close();
-    this.pendingSignals = [];
+    this.reportStatus({ p2pState: this.remoteParticipantJoined ? "negotiating" : "waiting", state: this.signalingState === "connected" ? "connected" : "reconnecting" });
     this.setStep("p2p", { state: "checking", detail: "Reconnecting peer-to-peer connection" });
     this.setStep("dataChannel", { channels: 0, state: "checking", detail: "Reconnecting data channels", transferred: this.dataTransfer() });
   }
 
+  private cancelPeerRecovery(): void {
+    if (this.recovery?.timer !== undefined) window.clearTimeout(this.recovery.timer);
+    if (this.recovery?.deadline !== undefined) window.clearTimeout(this.recovery.deadline);
+    this.recovery = null;
+  }
+
   private requestPeerRestart(): void {
-    if (this.closed || this.suspended || this.peerRestarting || !this.remoteParticipantJoined) return;
-    const waitForRemote = this.remoteSignalingDisconnected;
-    this.reportStatus({ p2pState: "recovering", state: "reconnecting" });
-    this.peerRestarting = !waitForRemote;
-    this.connectedNotified = false; this.stopDataChannelLatencyProbe(); this.closeDataChannels();
-    this.mediaTransport.detachPeer(); const peer = this.peer; this.peer = null; peer?.close();
-    this.peerLocalSlotId = null;
-    this.peerLocalSessionId = null;
-    this.setStep("p2p", { state: "checking", detail: "Reconnecting peer-to-peer connection" });
-    this.setStep("dataChannel", { channels: 0, state: "checking", detail: "Reconnecting data channels", transferred: this.dataTransfer() });
-    this.reportStatus({ detail: waitForRemote ? "Waiting for the other participant to reconnect" : "Reconnecting peer-to-peer connection", state: "reconnecting" });
-    if (this.seatState === "expired") {
-      this.openSocket("new");
-    } else if (!waitForRemote) {
-      this.openSocket("restart-peer");
-    }
+    if (this.closed || this.suspended || this.recovery || !this.remoteParticipantJoined) return;
+    const recovery: PeerRecovery = { key: this.peerIdentityKey() };
+    this.recovery = recovery;
+    this.resetPeerForNegotiation();
+    this.reportStatus({ detail: "Reconnecting peer-to-peer connection", p2pState: "recovering", state: "reconnecting" });
+    this.schedulePeerRecovery(recovery);
+  }
+
+  private schedulePeerRecovery(recovery: PeerRecovery): void {
+    if (this.recovery !== recovery || recovery.timer !== undefined || recovery.deadline !== undefined) return;
+    // Do not rotate sessions while signaling cannot deliver the handshake.
+    // Welcome/peer-reconnected will resume this same recovery attempt.
+    if (this.closed || this.suspended || !this.remoteParticipantJoined || this.remoteSignalingDisconnected
+      || this.signalingState !== "connected") return;
+    const backoff = this.recoveryAttempt === 0 ? 0 : Math.min(30_000, 1_000 * 2 ** Math.min(this.recoveryAttempt - 1, 5));
+    const delay = Math.max(backoff, this.initiator ? 0 : 1_000);
+    recovery.timer = window.setTimeout(() => {
+      recovery.timer = undefined;
+      if (this.recovery !== recovery || this.closed || this.suspended) return;
+      if (this.remoteSignalingDisconnected || this.signalingState !== "connected") return;
+      this.recoveryAttempt += 1;
+      recovery.deadline = window.setTimeout(() => {
+        if (this.recovery !== recovery || this.closed || this.suspended) return;
+        this.cancelPeerRecovery();
+        this.requestPeerRestart();
+      }, 30_000);
+      this.openSocket(this.seatState === "expired" ? "new" : "restart-peer");
+    }, delay);
   }
 
   private detectConnectionRoute = async (peer: RTCPeerConnection): Promise<void> => {
@@ -1433,12 +1589,12 @@ export class NativeWebRTCSession {
     } catch { /* stats are optional */ }
   };
 
-  private sendSignal(payload: SignalMessage["payload"]): void {
+  private sendSignal(payload: SignalMessage["payload"]): boolean {
     if (this.seatState !== "confirmed"
       || this.signalingState !== "connected"
       || this.peerLocalSlotId !== this.slotId
-      || this.peerLocalSessionId !== this.peerSessionId) return;
-    this.sendSocket({ type: "signal", epoch: this.epoch, fromSlotId: this.slotId ?? undefined, peerSessionId: this.peerSessionId ?? undefined, payload });
+      || this.peerLocalSessionId !== this.peerSessionId) return false;
+    return this.sendSocket({ type: "signal", epoch: this.epoch, fromSlotId: this.slotId ?? undefined, peerSessionId: this.peerSessionId ?? undefined, payload });
   }
 
   private startHeartbeat(generation: number, protocol: SignalingHeartbeatProtocol): void {
