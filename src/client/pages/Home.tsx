@@ -162,7 +162,7 @@ const homeCopy: Record<
         turn: "TURN",
         unavailable: "Unavailable",
       },
-      intro: "ZestSend is a WebRTC-powered peer-to-peer (P2P) data transfer website that lets you send data securely and privately, without server relays or storage.",
+      intro: "ZestSend uses WebRTC for end-to-end encrypted text, files and calls, with TURN relays when needed. Chat images use private Cloudflare storage over HTTPS for 24 hours and are not end-to-end encrypted. Chat history stays in this page's memory and is cleared on refresh.",
       title: "About ZestSend",
     },
     activities: [
@@ -217,7 +217,7 @@ const homeCopy: Record<
         turn: "TURN",
         unavailable: "不可用",
       },
-      intro: "ZestSend 是一个基于 WebRTC 的点对点（P2P）数据传输网站，支持安全、私密地传输数据，无需通过服务器中转或存储。",
+      intro: "ZestSend 通过 WebRTC 端对端加密传输文字、文件和通话，必要时使用 TURN 中继。聊天图片通过 HTTPS 存储于 Cloudflare 私有存储，24 小时后过期，不采用端对端加密。聊天历史仅保存在当前页面内存，刷新后清空。",
       title: "关于 ZestSend",
     },
     activities: [
@@ -948,7 +948,7 @@ export default function Home({ locale = "en" }: { locale?: HomeLocale }) {
             <>
               <div className="flex items-center justify-center gap-1.5 whitespace-nowrap sm:gap-3">
                 <TextRepel
-                  text="端对端加密"
+                  text="P2P 端对端加密"
                   radius={160}
                   strength={70}
                   className="text-emerald-300"
@@ -973,7 +973,7 @@ export default function Home({ locale = "en" }: { locale?: HomeLocale }) {
               <div className="mt-2 flex items-center justify-center gap-1.5 whitespace-nowrap sm:gap-3">
                 <span>with</span>
                 <TextRepel
-                  text="end-to-end encryption"
+                  text="P2P encryption"
                   radius={160}
                   strength={70}
                   className="text-emerald-300"

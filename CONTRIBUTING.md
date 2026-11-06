@@ -2,6 +2,10 @@
 
 Thanks for contributing.
 
+Before Cloudflare configuration, deployment, or production verification, follow
+the [dual-account rules in AGENTS.md](AGENTS.md). This repository uses two
+Cloudflare accounts with identically named Workers.
+
 ## Local setup
 
 Use Node.js with the pnpm version declared in `package.json`.

@@ -1,5 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  CHAT_IMAGE_BYTES_PER_HOUR, CHAT_IMAGE_MAX_BYTES, CHAT_IMAGE_MAX_CONCURRENT_UPLOADS,
+  CHAT_IMAGE_UPLOADS_PER_MINUTE, CHAT_IMAGE_UPLOAD_TIMEOUT_MS,
+} from "../shared/chat-image-limits";
+import {
   ACTIVE_SIGNALING_TIMEOUT_MS,
   ROOM_DISCONNECTED_LEASE_MS,
   SIGNALING_HEARTBEAT_CAPABILITY,
@@ -72,6 +76,20 @@ const MAX_MESSAGE_BYTES = 128 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const STORAGE_KEY = "room-state-v2";
 const textEncoder = new TextEncoder();
+const IMAGE_QUOTA_KEY = "chat-image-upload-quota-v1";
+
+type ImageUploadReservation = { bytes: number; expiresAt: number; hour: number };
+type ImageUploadQuota = {
+  minute: number;
+  attempts: number;
+  hour: number;
+  bytes: number;
+  reservations: Record<string, ImageUploadReservation>;
+};
+
+export type ImageUploadAdmission =
+  | { ok: true; slotId: string; uploadId: string }
+  | { ok: false; status: 401 | 429; retryAfterMs?: number };
 
 function emptyState(): RoomState {
   return { version: 2, epoch: 0, offererSlotId: null, slots: [] };
@@ -184,6 +202,71 @@ export class Room extends DurableObject<Env> {
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair(SIGNALING_HEARTBEAT_REQUEST, SIGNALING_HEARTBEAT_RESPONSE),
     );
+  }
+
+  /** HTTP uploads authenticate an existing seat without renewing or rotating it. */
+  async beginChatImageUpload(resumeToken: string, size: number): Promise<ImageUploadAdmission> {
+    if (!resumeToken || resumeToken.length > 512 || !Number.isInteger(size) || size <= 0 || size > CHAT_IMAGE_MAX_BYTES) {
+      return { ok: false, status: 401 };
+    }
+    const digest = await tokenHash(resumeToken);
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+      const state = normalizeState(await this.ctx.storage.get(STORAGE_KEY));
+      const slot = state.slots.find((candidate) => candidate.tokenHash && candidate.tokenHash === digest);
+      if (!slot) return { ok: false, status: 401 } as const;
+      const socket = slot.connectionId ? this.socketForSlot(slot) : undefined;
+      const attachment = socket ? attachmentFor(socket) : undefined;
+      const lastActivity = socket && attachment ? this.lastSignalingActivityAt(socket, attachment) : null;
+      const active = socket && attachment && socketIsLive(socket)
+        && lastActivity !== null && now - lastActivity <= ACTIVE_SIGNALING_TIMEOUT_MS;
+      const leased = slot.connectionId === null && slot.leaseExpiresAt !== null && slot.leaseExpiresAt > now;
+      if (!active && !leased) return { ok: false, status: 401 } as const;
+
+      const quotas = await this.ctx.storage.get<Record<string, ImageUploadQuota>>(IMAGE_QUOTA_KEY) ?? {};
+      const minute = Math.floor(now / 60_000);
+      const hour = Math.floor(now / 3_600_000);
+      for (const [id, value] of Object.entries(quotas)) {
+        for (const [uploadId, reservation] of Object.entries(value.reservations)) {
+          if (reservation.expiresAt <= now) delete value.reservations[uploadId];
+        }
+        if (value.hour < hour && !Object.keys(value.reservations).length) delete quotas[id];
+      }
+      const quota = quotas[slot.slotId] ?? { minute, attempts: 0, hour, bytes: 0, reservations: {} };
+      if (quota.minute !== minute) { quota.minute = minute; quota.attempts = 0; }
+      if (quota.hour !== hour) { quota.hour = hour; quota.bytes = 0; }
+      if (Object.keys(quota.reservations).length >= CHAT_IMAGE_MAX_CONCURRENT_UPLOADS) {
+        return { ok: false, status: 429, retryAfterMs: 1_000 } as const;
+      }
+      if (quota.attempts >= CHAT_IMAGE_UPLOADS_PER_MINUTE) {
+        return { ok: false, status: 429, retryAfterMs: (minute + 1) * 60_000 - now } as const;
+      }
+      if (quota.bytes + size > CHAT_IMAGE_BYTES_PER_HOUR) {
+        return { ok: false, status: 429, retryAfterMs: (hour + 1) * 3_600_000 - now } as const;
+      }
+      const uploadId = crypto.randomUUID();
+      quota.attempts += 1;
+      quota.bytes += size;
+      quota.reservations[uploadId] = { bytes: size, expiresAt: now + CHAT_IMAGE_UPLOAD_TIMEOUT_MS + 10_000, hour };
+      quotas[slot.slotId] = quota;
+      await this.ctx.storage.put(IMAGE_QUOTA_KEY, quotas);
+      return { ok: true, slotId: slot.slotId, uploadId } as const;
+    });
+  }
+
+  async finishChatImageUpload(slotId: string, uploadId: string, actualBytes: number): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const quotas = await this.ctx.storage.get<Record<string, ImageUploadQuota>>(IMAGE_QUOTA_KEY);
+      const quota = quotas?.[slotId];
+      const reservation = quota?.reservations[uploadId];
+      if (!quotas || !quota || !reservation) return;
+      delete quota.reservations[uploadId];
+      // A reservation from the previous hour must not change the new hour's budget.
+      if (quota.hour === reservation.hour) {
+        quota.bytes -= reservation.bytes - Math.max(0, Math.min(reservation.bytes, Math.floor(actualBytes) || 0));
+      }
+      await this.ctx.storage.put(IMAGE_QUOTA_KEY, quotas);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {

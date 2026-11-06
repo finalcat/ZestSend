@@ -314,11 +314,15 @@ async function createRoomPeer(page: Page, roomId: string, interceptSignaling = t
     });
     routeRegistered = true;
   };
-  await page.route("**/api/turn/credentials", (route) => route.fulfill({
-    status: 503,
-    contentType: "application/json",
-    json: { error: "TURN credentials are not configured." },
-  }));
+  // Production acceptance must exercise the target Worker's real TURN binding.
+  // The ordinary local suite retains its deterministic STUN-only setup.
+  if (test.info().config.metadata.realTurn !== true) {
+    await page.route("**/api/turn/credentials", (route) => route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      json: { error: "TURN credentials are not configured." },
+    }));
+  }
 
   await page.goto(`/en/room/${roomId}`);
 
@@ -626,8 +630,8 @@ test.describe("signaling-only interruptions", () => {
     try {
       await pair.alice.getByRole("button", { name: "Collaborate" }).click();
       await pair.bob.getByRole("button", { name: "Collaborate" }).click();
-      const aliceEditor = pair.alice.locator('[contenteditable="true"]');
-      const bobEditor = pair.bob.locator('[contenteditable="true"]');
+      const aliceEditor = pair.alice.locator('.zest-collaboration-editor[contenteditable="true"]');
+      const bobEditor = pair.bob.locator('.zest-collaboration-editor[contenteditable="true"]');
       await expect(aliceEditor).toBeVisible();
       await expect(bobEditor).toBeVisible();
       await aliceEditor.fill("Collaboration survives signaling loss");
@@ -675,7 +679,7 @@ test.describe("signaling-only interruptions", () => {
       const payload = Buffer.alloc(32 * 1024 * 1024, 0x5a);
       const expectedDigest = createHash("sha256").update(payload).digest("hex");
       await pair.alice.getByRole("button", { name: "Files" }).click();
-      await pair.alice.locator('input[type="file"]').setInputFiles({
+      await pair.alice.locator('input[type="file"]:not([accept])').setInputFiles({
         name: "signaling-resume-integrity.bin",
         mimeType: "application/octet-stream",
         buffer: payload,
@@ -719,7 +723,7 @@ test.describe("signaling-only interruptions", () => {
     const pair = await createPair(browser, roomId);
     try {
       await pair.alice.getByRole("button", { name: "Files" }).click();
-      await pair.alice.locator('input[type="file"]').setInputFiles({
+      await pair.alice.locator('input[type="file"]:not([accept])').setInputFiles({
         name: "lease-interruption.bin",
         mimeType: "application/octet-stream",
         buffer: Buffer.alloc(32 * 1024 * 1024, 0x5a),

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NativeWebRTCSession } from "../src/client/lib/webrtc";
+import type { RichChatMessage } from "../src/shared/chat-protocol";
 
 vi.mock("../src/client/lib/media-transport", () => ({
   MediaTransport: class {
@@ -56,7 +57,7 @@ class FakeChannel {
   onerror: (() => void) | null = null;
   onmessage: ((event: { data: unknown }) => void) | null = null;
   constructor(readonly label: string) {}
-  send() {}
+  send = vi.fn((_data: string | ArrayBuffer | Blob) => undefined);
   close() { this.readyState = "closed"; this.onclose?.(); }
 }
 
@@ -139,7 +140,8 @@ function acceptRestart(epoch: number, localSession: string, initiator = false) {
 
 function start(initiator = false) {
   const onError = vi.fn();
-  const session = new NativeWebRTCSession("room", vi.fn(), vi.fn(), onError, vi.fn(), vi.fn(), vi.fn(), vi.fn(), vi.fn(), vi.fn(), vi.fn());
+  const onMessage = vi.fn();
+  const session = new NativeWebRTCSession("room", vi.fn(), vi.fn(), onError, vi.fn(), vi.fn(), vi.fn(), onMessage, vi.fn(), vi.fn(), vi.fn());
   sessions.push(session);
   session.connect();
   const socket = FakeSocket.instances.at(-1)!;
@@ -149,7 +151,7 @@ function start(initiator = false) {
     isInitiator: initiator, offererSlotId: initiator ? "local" : "remote", peerCount: 2,
   });
   negotiate(socket, 1, "remote-1", initiator);
-  return { session, socket, onError };
+  return { session, socket, onError, onMessage };
 }
 
 const sessions: NativeWebRTCSession[] = [];
@@ -182,6 +184,122 @@ afterEach(() => {
   for (const session of sessions.splice(0)) session.suspend();
   vi.clearAllTimers();
   vi.useRealTimers();
+});
+
+function richMessage(): RichChatMessage {
+  const expiresAt = 1_794_027_600_000;
+  const imageId = `${expiresAt}-${"a".repeat(32)}`;
+  return {
+    type: "chat-rich", version: 1, id: "rich-message",
+    blocks: [{ type: "paragraph", text: "A screenshot" }, { type: "image", imageId }],
+    images: [{ imageId, readToken: "r".repeat(43), expiresAt, mimeType: "image/png", size: 512,
+      width: 10, height: 10, name: "image.png", original: false }],
+  };
+}
+
+function openChannel(peer: FakePeer, name: string): FakeChannel {
+  const channel = peer.channels.find((entry) => entry.label === name)!;
+  channel.readyState = "open";
+  channel.onopen?.();
+  return channel;
+}
+
+describe("rich chat compatibility and upload authorization", () => {
+  it("announces capabilities on control open before the other channels are available", async () => {
+    const { session } = start(true);
+    const support = vi.fn();
+    const unsubscribe = session.subscribeChatImageSupport(support);
+    const control = openChannel(FakePeer.instances[0], "control");
+    expect(control.send).toHaveBeenCalledWith(JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }));
+    expect(session.chatImageSupport).toBe("unknown");
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.chatImageSupport).toBe("supported");
+    expect(support.mock.calls.map(([value]) => value)).toEqual(["unknown", "supported"]);
+    const announcements = control.send.mock.calls.filter(([data]) => typeof data === "string" && data.includes("chat-capabilities"));
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(control.send.mock.calls.filter(([data]) => typeof data === "string" && data.includes("chat-capabilities"))).toHaveLength(announcements.length);
+    unsubscribe();
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(session.chatImageSupport).toBe("supported");
+  });
+
+  it("falls back to text for an old peer and accepts a late capability announcement", async () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(session.chatImageSupport).toBe("unknown");
+    expect(session.sendRichChatMessage(richMessage())).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(session.chatImageSupport).toBe("unsupported");
+    expect(session.sendChatMessage("legacy-text", "still usable")).toBe(true);
+    expect(interactive.send).toHaveBeenCalledWith(JSON.stringify({ id: "legacy-text", text: "still usable", type: "chat" }));
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.sendRichChatMessage(richMessage())).toBe(true);
+    expect(interactive.send).toHaveBeenCalledWith(JSON.stringify(richMessage()));
+    expect(session.sendRichChatMessage({ ...richMessage(), images: [] })).toBe(false);
+  });
+
+  it("validates incoming rich messages, acknowledges duplicates and delivers only once", () => {
+    const { session, onMessage } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    const data = JSON.stringify(richMessage());
+    interactive.onmessage?.({ data });
+    interactive.onmessage?.({ data });
+    interactive.onmessage?.({ data: JSON.stringify({ ...richMessage(), id: "bad", images: [{ ...richMessage().images[0], src: "https://example.com" }] }) });
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(richMessage());
+    expect(control.send.mock.calls.filter(([payload]) => typeof payload === "string" && JSON.parse(payload).type === "chat-received")).toHaveLength(2);
+    expect(session.chatImageSupport).toBe("supported");
+  });
+
+  it("clears peer-specific capabilities and ignores late callbacks from the old control channel", async () => {
+    const { session, socket } = start(true);
+    const control = openChannel(FakePeer.instances[0], "control");
+    const oldReceive = control.onmessage;
+    oldReceive?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.chatImageSupport).toBe("supported");
+    negotiate(socket, 2, "remote-2", true);
+    expect(session.chatImageSupport).toBe("unknown");
+    oldReceive?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(session.chatImageSupport).toBe("unknown");
+    openChannel(FakePeer.instances[1], "control");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(session.chatImageSupport).toBe("unsupported");
+  });
+
+  it("only exposes an admitted, locally valid upload authorization", async () => {
+    const { session, socket } = start(true);
+    expect(session.getImageUploadAuthorization()).toBe("token");
+    socket.close();
+    expect(session.getImageUploadAuthorization()).toBe("token");
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(session.getImageUploadAuthorization()).toBeNull();
+  });
+
+  it("waits for a fresh authoritative resume token without accepting the rejected token", async () => {
+    const { session, socket } = start(true);
+    const waiting = session.waitForImageUploadAuthorization("token");
+    socket.receive({ type: "welcome", epoch: 2, slotId: "local", peerSessionId: "local-1", resumeToken: "rotated-token",
+      isInitiator: true, offererSlotId: "local", peerCount: 2, resumed: true });
+    await expect(waiting).resolves.toBe("rotated-token");
+    await expect(session.waitForImageUploadAuthorization("token")).resolves.toBe("rotated-token");
+  });
+
+  it.each(["suspend", "close", "abort", "timeout"] as const)("settles upload authorization waiting after %s", async (operation) => {
+    const { session } = start(true);
+    const controller = new AbortController();
+    const waiting = session.waitForImageUploadAuthorization("token", controller.signal);
+    if (operation === "abort") controller.abort();
+    else if (operation === "timeout") await vi.advanceTimersByTimeAsync(5_000);
+    else session[operation]();
+    await expect(waiting).resolves.toBeNull();
+    if (operation === "suspend" || operation === "close") expect(session.getImageUploadAuthorization()).toBeNull();
+  });
 });
 
 describe("WebRTC negotiation ownership and delivery", () => {

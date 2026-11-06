@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { Room } from "./room";
+import { cleanupExpiredChatImages, downloadChatImage, uploadChatImage } from "./chat-images";
 
 type ApiBindings = Env & {
   TURN_ID?: string;
@@ -110,6 +111,15 @@ function methodNotAllowed(message: string): Response {
   return Response.json({ message }, { status: 405 });
 }
 
+app.use("/api/chat-images/*", async (context, next) => {
+  await next();
+  context.header("Cache-Control", "private, no-store");
+});
+app.use("/api/rooms/:roomId/chat-images", async (context, next) => {
+  await next();
+  context.header("Cache-Control", "private, no-store");
+});
+
 app.get("/api/rooms/:roomId/ws", async (context) => {
   const roomId = context.req.param("roomId");
   if (!roomIsValid(roomId)) return context.json({ message: "Invalid room ID." }, 400);
@@ -119,6 +129,17 @@ app.get("/api/rooms/:roomId/ws", async (context) => {
 
   return roomFor(context.env, roomId).fetch(context.req.raw);
 });
+
+app.post("/api/rooms/:roomId/chat-images", (context) => {
+  const roomId = context.req.param("roomId");
+  if (!roomIsValid(roomId)) return context.json({ message: "Invalid room ID." }, 400);
+  return uploadChatImage(context.req.raw, context.env, roomId);
+});
+
+app.get("/api/chat-images/:imageId", (context) => downloadChatImage(context.req.raw, context.env, context.req.param("imageId")));
+
+app.all("/api/rooms/:roomId/chat-images", () => methodNotAllowed("Method not allowed"));
+app.all("/api/chat-images/:imageId", () => methodNotAllowed("Method not allowed"));
 
 app.post("/api/turn/credentials", async (context) => {
   if (!context.env.TURN_ID || !context.env.TURN_TOKEN) {
@@ -166,4 +187,9 @@ app.onError((error, context) => {
 });
 
 export { Room };
-export default app;
+export default {
+  fetch: app.fetch,
+  scheduled(event, env, context) {
+    context.waitUntil(cleanupExpiredChatImages(env, event.scheduledTime));
+  },
+} satisfies ExportedHandler<ApiBindings>;

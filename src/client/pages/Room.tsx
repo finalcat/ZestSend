@@ -35,7 +35,6 @@ import {
   RiMicOffLine,
   RiMagicLine,
   RiPlayCircleLine,
-  RiPulseLine,
   RiRadioButtonLine,
   RiPauseLine,
   RiPlayLine,
@@ -71,6 +70,11 @@ import { type CSSProperties, type DragEventHandler, type ReactNode, useEffect, u
 import * as Y from "yjs";
 
 import Layout from "../components/Layout";
+import { ChatComposer, createEmptyChatComposerState, disposeChatComposerState, type ChatComposerState, type ChatComposerSubmit } from "../components/chat-composer";
+import { ChatImageMessage, type LocalChatImagePreview } from "../components/chat-image-message";
+import { ChatImageAssetStore, ChatImageUploadQueue, ChatImageRequestError, chatImageErrorText } from "../lib/chat-image-client";
+import type { PreparedChatImage } from "../lib/chat-images";
+import type { ChatBlock, CloudChatImage, RichChatMessage } from "../../shared/chat-protocol";
 import { CollaborationCanvas } from "../components/collaboration-canvas";
 import { CollaborationWorkspace } from "../components/collaboration-editor";
 import { useTheme } from "../components/theme";
@@ -105,8 +109,31 @@ type ChatMessage = {
   id: string;
   lastAttemptedAt?: number;
   text: string;
+  blocks?: ChatBlock[];
+  images?: CloudChatImage[];
+  localImages?: LocalChatImagePreview[];
+  rich?: RichChatMessage;
+  uploadState?: "waiting" | "uploading" | "complete" | "error";
+  uploadCount?: number;
+  imageError?: string;
   sender: "local" | "remote";
   sentAt: number;
+};
+
+type ChatController = {
+  state: ChatComposerState;
+  onStateChange: (state: ChatComposerState) => void;
+  onSend: (draft: ChatComposerSubmit) => boolean;
+  onRetry: (id: string) => void;
+  imageStore: ChatImageAssetStore;
+  assetVersion: number;
+  error: string | null;
+};
+type PendingChatUpload = {
+  draft: ChatComposerSubmit;
+  previews: LocalChatImagePreview[];
+  uploaded: Map<string, CloudChatImage>;
+  running: boolean;
 };
 
 const workspaceShellClassName = "flex h-full min-h-0 w-full max-w-2xl flex-col pb-[clamp(6rem,7vh,7rem)] pt-6 lg:max-w-3xl";
@@ -117,6 +144,7 @@ function WorkspaceShell({
   banner,
   children,
   footer,
+  composerAutoSize = false,
   reverse = false,
   status,
   onDragEnter,
@@ -129,6 +157,7 @@ function WorkspaceShell({
   banner?: ReactNode;
   children: ReactNode;
   footer: ReactNode;
+  composerAutoSize?: boolean;
   reverse?: boolean;
   status?: ReactNode;
   onDragEnter?: DragEventHandler<HTMLElement>;
@@ -155,7 +184,7 @@ function WorkspaceShell({
         onSubmit?.();
       }}>
         {status}
-        <div className={workspaceComposerClassName}>{footer}</div>
+        <div className={composerAutoSize ? "relative min-h-28 shrink-0" : workspaceComposerClassName}>{footer}</div>
       </form>
     </section>
   );
@@ -185,7 +214,7 @@ function displayedNumber(value: number, precision = 0): number {
 const ignoreDialogOpenChange = () => undefined;
 
 type RoomLocale = "en" | "zh";
-type WorkspaceId = "chat" | "files" | "video" | "voice" | "watch" | "collaborate" | "canvas" | "status";
+type WorkspaceId = "chat" | "files" | "video" | "voice" | "watch" | "collaborate" | "canvas";
 // Whether a peer transport exists: "solo" = seat admitted, nobody else in the
 // room; "away" = had a peer, lost it. Both keep the chat workspace usable.
 type PeerPresence = "solo" | "connecting" | "active" | "away";
@@ -218,8 +247,8 @@ const roomCopy = {
     peerAwayDescription: "Messages you leave in Chat will sync when they return.",
     collapseStatus: "Hide connection status",
     expandStatus: "Show connection status",
-    encrypted: "End-to-end encrypted · Direct",
-    encryptedRelay: "End-to-end encrypted · Relay",
+    encrypted: "P2P encrypted · Direct",
+    encryptedRelay: "P2P encrypted · Relay",
     leave: "Exit",
     share: "Share",
     copied: "Room link copied",
@@ -248,8 +277,8 @@ const roomCopy = {
     peerAwayDescription: "留言将在对方回来后自动同步。",
     collapseStatus: "收起连接状态",
     expandStatus: "展开连接状态",
-    encrypted: "端对端加密 · 直连",
-    encryptedRelay: "端对端加密 · 中继",
+    encrypted: "P2P 加密 · 直连",
+    encryptedRelay: "P2P 加密 · 中继",
     leave: "退出",
     share: "分享",
     copied: "房间链接已复制",
@@ -268,7 +297,6 @@ const workspaceCopy = {
       chat: ["Chat", "Messages remain available while you work elsewhere."],
       collaborate: ["Collaborate", "A shared document for the room."],
       files: ["Files", "Send files or let the other participant choose what to receive."],
-      status: ["Connection status", "Live measurements for this private room."],
       video: ["Video", "Video calls and screen sharing share one media session."],
       voice: ["Voice", "Keep a voice channel running in the background."],
       watch: ["Watch together", "Synchronize a shared video or audio session."],
@@ -285,7 +313,6 @@ const workspaceCopy = {
     exitDescription: "This will close your end-to-end connection and stop all room activity.",
     exitTitle: "Leave this room?",
     room: "ROOM",
-    statusHint: "All values update from the active connection.",
     typing: "Typing...",
   },
   zh: {
@@ -294,7 +321,6 @@ const workspaceCopy = {
       chat: ["聊天", "切换到其他功能时，消息仍会保持可用。"],
       collaborate: ["协作", "在房间内共同编辑文档。"],
       files: ["文件", "发送文件，或让对方选择需要接收的文件。"],
-      status: ["连接状态", "查看这个私密房间的实时连接测量。"],
       video: ["视频", "视频通话与屏幕共享使用同一媒体会话。"],
       voice: ["语音", "在后台持续保持一条语音通道。"],
       watch: ["同播", "同步观看视频或一起听音频。"],
@@ -311,24 +337,26 @@ const workspaceCopy = {
     exitDescription: "这将关闭端对端连接，并停止房间内的所有活动。",
     exitTitle: "确认退出房间？",
     room: "房间",
-    statusHint: "所有数值均来自当前活跃连接。",
     typing: "正在输入...",
   },
 } as const;
 
-const workspaceOrder: WorkspaceId[] = ["chat", "files", "video", "voice", "watch", "collaborate", "canvas", "status"];
+const workspaceOrder: WorkspaceId[] = ["chat", "files", "video", "voice", "watch", "collaborate", "canvas"];
 const workspaceIcons = {
   canvas: RiBrushLine,
   chat: RiChat3Line,
   collaborate: RiFileEditLine,
   files: RiFolderTransferLine,
-  status: RiPulseLine,
   video: RiVideoOnLine,
   voice: RiMicLine,
   watch: RiPlayCircleLine,
 } as const;
 
 function workspaceFromHash(): WorkspaceId | null {
+  if (window.location.hash === "#status") {
+    window.history.replaceState(null, "", "#chat");
+    return "chat";
+  }
   const workspaceId = window.location.hash.slice(1) as WorkspaceId;
   return workspaceOrder.includes(workspaceId) ? workspaceId : null;
 }
@@ -559,7 +587,7 @@ function useShareRoom(roomId: string, locale: RoomLocale) {
 }
 
 // The connection card body shared by the blocking ConnectionDialog and the
-// corner ConnectionStatusCard: room number, share/exit actions, and the six
+// corner ConnectionStatusCard: room number, optional actions, and the six
 // connection steps.
 function ConnectionCardDetails({
   error,
@@ -567,12 +595,14 @@ function ConnectionCardDetails({
   onRequestLeave,
   progress,
   roomId,
+  showActions = true,
 }: {
   error: string | null;
   locale: RoomLocale;
-  onRequestLeave: () => void;
+  onRequestLeave?: () => void;
   progress: ConnectionProgress;
   roomId: string;
+  showActions?: boolean;
 }) {
   const copy = roomCopy[locale];
   const { shareRoom, shareStatus } = useShareRoom(roomId, locale);
@@ -599,10 +629,10 @@ function ConnectionCardDetails({
             transitionKey={shareStatus === "copied" ? "copied" : error ?? "preparing"}
             type="fade"
           >
-            {shareStatus === "copied" ? copy.copied : error ? localizedDetail(locale, error) : copy.preparing(roomId)}
+            {shareStatus === "copied" ? copy.copied : error ? localizedDetail(locale, error) : showActions ? copy.preparing(roomId) : (locale === "zh" ? `请让对方输入房间号：${roomId}` : `Ask the other participant to enter room ${roomId}.`)}
           </AutoTransition>
         </div>
-        <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
+        {showActions ? <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
           <button
             aria-label={copy.share}
             className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-white/[0.1] px-3 text-sm font-semibold tracking-[0.04em] text-sky-100/75 transition-colors hover:bg-white/[0.05] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60 sm:h-10 sm:w-auto"
@@ -621,7 +651,7 @@ function ConnectionCardDetails({
             <RiLogoutBoxRLine aria-hidden="true" className="size-5" />
             <span>{copy.leave}</span>
           </button>
-        </div>
+        </div> : null}
       </div>
       <div className="divide-y divide-white/10 px-6 sm:px-8">
         <StatusRow icon={RiGlobalLine} label={copy.resource} locale={locale} nonBlockingFailure status={progress.resource} />
@@ -801,55 +831,6 @@ function HeaderConnectionToggle({
   );
 }
 
-function StatusMetric({ icon: Icon, label, locale, realtimeConnection = false, status }: {
-  icon: typeof RiRouterLine;
-  label: string;
-  locale: RoomLocale;
-  realtimeConnection?: boolean;
-  status: ConnectionStep;
-}) {
-  const tone = status.latency !== undefined
-    ? latencyColor(status.latency, realtimeConnection)
-    : status.state === "active" || status.state === "ready"
-    ? "text-emerald-300"
-    : status.state === "error"
-      ? "text-rose-300"
-      : status.state === "checking"
-        ? "text-sky-300"
-        : "text-slate-400";
-
-  return (
-    <div className="flex items-center gap-3 border-b border-white/10 py-4 last:border-b-0">
-      <Icon aria-hidden="true" className={`size-5 ${tone}`} />
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-bold tracking-[0.04em] text-sky-50">{label}</p>
-        <AutoTransition
-          as="span"
-          className="mt-1 block truncate text-xs font-medium tracking-[0.03em] text-sky-100/50"
-          duration={0.22}
-          transitionKey={status.detail}
-          type="fade"
-        >
-          {localizedDetail(locale, status.detail)}
-        </AutoTransition>
-      </div>
-      {status.transferred !== undefined ? (
-        <DataTransferStats transferred={status.transferred} />
-      ) : (
-        <AutoTransition
-          as="span"
-          className="inline-flex shrink-0 items-center font-mono text-sm font-semibold leading-none tabular-nums"
-          duration={0.22}
-          transitionKey={status.latency !== undefined ? "latency" : "empty"}
-          type="fade"
-        >
-          {status.latency !== undefined ? <LatencyValue latency={status.latency} realtimeConnection={realtimeConnection} /> : null}
-        </AutoTransition>
-      )}
-    </div>
-  );
-}
-
 // Cap the rendered chat history: every message carries framer-motion layout
 // measurement, so an unbounded list makes each layout pass O(n). Only the
 // newest slice is mounted; older entries expand on demand.
@@ -857,7 +838,7 @@ const CHAT_RENDER_LIMIT = 50;
 const CHAT_RENDER_STEP = 50;
 
 // Slim hint above the chat composer while there is no peer transport. The
-// room number and share action live in the corner ConnectionStatusCard, so
+// room number lives in the corner ConnectionStatusCard, so
 // this banner stays text-only.
 function ChatPresenceBanner({ locale, mode }: { locale: RoomLocale; mode: "solo" | "away" }) {
   const workspace = workspaceCopy[locale];
@@ -873,22 +854,28 @@ function ChatPresenceBanner({ locale, mode }: { locale: RoomLocale; mode: "solo"
 }
 
 // The connection card in corner form: same information as the blocking
-// ConnectionDialog (room number, share/exit, six connection steps), floating
+// ConnectionDialog (room number and six connection steps), floating
 // top-right over the workspace while no peer transport exists so it never
 // blocks the conversation. Collapses to a slim bar.
 function ConnectionStatusCard({
   locale,
-  onRequestLeave,
   progress,
   roomId,
 }: {
   locale: RoomLocale;
-  onRequestLeave: () => void;
   progress: ConnectionProgress;
   roomId: string;
 }) {
   const copy = roomCopy[locale];
   const [collapsed, setCollapsed] = useState(false);
+  useEffect(() => {
+    // Keep the expanded progress card from covering the solo chat composer.
+    const focusComposer = (event: FocusEvent) => {
+      if (event.target instanceof HTMLElement && event.target.closest("[data-chat-composer]")) setCollapsed(true);
+    };
+    window.addEventListener("focusin", focusComposer);
+    return () => window.removeEventListener("focusin", focusComposer);
+  }, []);
   const toggleClassName = "inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-sky-100/60 transition-colors hover:bg-white/[0.06] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60";
 
   if (collapsed) {
@@ -918,7 +905,7 @@ function ConnectionStatusCard({
       >
         <RiArrowUpSLine aria-hidden="true" className="size-4" />
       </button>
-      <ConnectionCardDetails error={null} locale={locale} onRequestLeave={onRequestLeave} progress={progress} roomId={roomId} />
+      <ConnectionCardDetails error={null} locale={locale} showActions={false} progress={progress} roomId={roomId} />
     </aside>
   );
 }
@@ -930,7 +917,8 @@ function ChatWorkspace({
   loadMoreLabel,
   messages,
   onMarkRead,
-  onSend,
+  controller,
+  locale,
   onTyping,
   peerTyping,
   placeholder,
@@ -943,30 +931,21 @@ function ChatWorkspace({
   loadMoreLabel: (count: number) => string;
   messages: ChatMessage[];
   onMarkRead: (id: string) => boolean;
-  onSend: (text: string) => boolean;
+  controller: ChatController;
+  locale: RoomLocale;
   onTyping: () => void;
   peerTyping: boolean;
   placeholder: string;
   ready: boolean;
   typingLabel: string;
 }) {
-  const [draft, setDraft] = useState("");
   const [visibleCount, setVisibleCount] = useState(CHAT_RENDER_LIMIT);
-  const composerRef = useRef<HTMLTextAreaElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const readMessageIdsRef = useRef(new Set<string>());
-  const hasFocusedComposerRef = useRef(false);
-  const canSend = ready && draft.trim().length > 0;
 
   // The message list renders bottom-up inside a column-reverse scroller:
   // scrollTop 0 is the newest message, so the browser pins to the bottom
   // natively and never yanks a user who scrolled up — no JS scrolling.
-
-  useEffect(() => {
-    if (!ready || hasFocusedComposerRef.current) return;
-    hasFocusedComposerRef.current = true;
-    window.requestAnimationFrame(() => composerRef.current?.focus());
-  }, [ready]);
 
   useEffect(() => {
     const viewport = messageListRef.current?.closest("[data-overlayscrollbars-viewport]");
@@ -983,13 +962,7 @@ function ChatWorkspace({
 
     viewport.querySelectorAll<HTMLElement>("[data-chat-message-id]").forEach((message) => observer.observe(message));
     return () => observer.disconnect();
-  }, [messages, onMarkRead, ready]);
-
-  const send = () => {
-    if (!canSend || !onSend(draft)) return;
-    setDraft("");
-    window.requestAnimationFrame(() => composerRef.current?.focus());
-  };
+  }, [messages, onMarkRead, ready, controller.assetVersion]);
 
   const hiddenCount = Math.max(0, messages.length - visibleCount);
   // slice() copies before reverse(): messages (sorted ascending) is never
@@ -999,39 +972,9 @@ function ChatWorkspace({
 
   return (
     <WorkspaceShell
-      banner={banner}
-      footer={(
-        <>
-          <textarea
-            aria-label={placeholder}
-            className="absolute bottom-0 left-0 h-28 w-full resize-none rounded-2xl border border-white/10 bg-black/25 px-4 py-3 pr-14 text-sm font-medium leading-relaxed tracking-[0.03em] text-sky-50 outline-none transition-colors placeholder:text-sky-100/35 focus:border-sky-100/35 focus:bg-black/30 disabled:cursor-not-allowed disabled:opacity-45"
-            disabled={!ready}
-            maxLength={4_000}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              if (event.target.value) onTyping();
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                send();
-              }
-            }}
-            placeholder={placeholder}
-            ref={composerRef}
-            value={draft}
-          />
-          <button
-            aria-label={placeholder}
-            className="absolute bottom-3 right-3 inline-flex size-9 items-center justify-center rounded-xl text-sky-50 transition-all focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/70 disabled:cursor-not-allowed disabled:opacity-35"
-            disabled={!canSend}
-            style={{ backgroundColor: canSend ? `${accent}80` : "rgb(255 255 255 / 0.08)" }}
-            type="submit"
-          >
-            <RiSendPlane2Fill aria-hidden="true" className="size-4" />
-          </button>
-        </>
-      )}
+      banner={<>{banner}{controller.error ? <p className="mb-2 text-xs text-rose-300" role="alert">{controller.error}</p> : null}</>}
+      composerAutoSize
+      footer={<ChatComposer accent={accent} locale={locale} onSend={controller.onSend} onStateChange={controller.onStateChange} onTyping={onTyping} ready={ready} state={controller.state} />}
       status={(
         <AutoTransition
           as="span"
@@ -1044,7 +987,6 @@ function ChatWorkspace({
           {peerTyping ? typingLabel : null}
         </AutoTransition>
       )}
-      onSubmit={send}
       reverse
       scrollKey={`${messages.length}:${visibleCount}`}
     >
@@ -1060,19 +1002,20 @@ function ChatWorkspace({
                       animate={{ opacity: 1, y: 0 }}
                       className={`mb-5 flex flex-col ${isLocal ? "items-end" : "items-start"}`}
                       data-chat-message-id={isLocal ? undefined : message.id}
+                      data-chat-kind={message.blocks ? "rich" : "text"}
                       exit={{ opacity: 0, y: -6 }}
                       initial={{ opacity: 0, y: 10 }}
                       transition={{ duration: 0.2, ease: "easeOut" }}
                     >
                       <div className="relative max-w-[82%] sm:max-w-[72%]">
-                        <p
+                        <div
                           className={`relative whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm font-medium leading-relaxed tracking-[0.03em] ${isLocal ? "rounded-br-none" : "rounded-bl-none"}`}
                           style={isLocal
                             ? { backgroundColor: `${accent}40`, color: "var(--zest-ink-strong)" }
                             : { backgroundColor: "var(--zest-bubble-remote-bg)", color: "var(--zest-bubble-remote-fg)" }}
                         >
-                          {message.text}
-                        </p>
+                          {message.blocks ? <ChatImageMessage blocks={message.blocks} images={message.images} localImages={message.localImages} locale={locale} store={controller.imageStore} /> : message.text}
+                        </div>
                         <svg
                           aria-hidden="true"
                           className={`absolute bottom-0 ${isLocal ? "-right-2" : "-left-2 scale-x-[-1]"}`}
@@ -1083,6 +1026,9 @@ function ChatWorkspace({
                           <path d="M 0 0 L 8 12 L 0 12 Z" fill={isLocal ? `${accent}40` : "rgb(0 0 0 / 0.25)"} />
                         </svg>
                       </div>
+                      {isLocal && (message.uploadState === "waiting" || message.uploadState === "uploading") ? <span className="mt-1 text-xs opacity-60" role="status">{message.uploadState === "waiting" ? (locale === "zh" ? "等待连接后上传图片" : "Images queued until the room reconnects") : (locale === "zh" ? `上传图片 ${message.uploadCount ?? 0}/${message.localImages?.length ?? 0}` : `Uploading images ${message.uploadCount ?? 0}/${message.localImages?.length ?? 0}`)}</span> : null}
+                      {isLocal && message.imageError ? <span className="mt-1 max-w-[82%] text-xs text-rose-300" role="alert">{message.imageError}</span> : null}
+                      {isLocal && (message.deliveryStatus === "error" || message.uploadState === "error") ? <button aria-label={locale === "zh" ? "重试发送消息" : "Retry message"} className="mt-1 inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs hover:bg-white/10" onClick={() => controller.onRetry(message.id)} type="button"><RiRefreshLine aria-hidden="true" className="size-3" />{locale === "zh" ? "重试" : "Retry"}</button> : null}
                       <p className={`mt-1.5 flex h-4 items-center gap-1.5 px-1 text-xs font-medium leading-none tabular-nums text-sky-100/40 ${isLocal ? "justify-end" : "justify-start"}`}>
                         <time dateTime={new Date(message.sentAt).toISOString()}>
                           {new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(message.sentAt)}
@@ -2535,7 +2481,7 @@ function RoomWorkspace({
   roomId,
   connectionRoute,
   connectionNotice,
-  onSendChatMessage,
+  chatController,
   voiceActive,
   videoActive,
 }: {
@@ -2597,7 +2543,7 @@ function RoomWorkspace({
   roomId: string;
   connectionRoute: ConnectionRoute;
   connectionNotice: string | null;
-  onSendChatMessage: (text: string) => boolean;
+  chatController: ChatController;
   voiceActive: boolean;
   videoActive: boolean;
 }) {
@@ -2793,7 +2739,7 @@ function RoomWorkspace({
                 const isRunning = runningWorkspaces.includes(activeWorkspace);
 
                 return (
-                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
+                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
                     {activeWorkspace === "chat" ? (
                       <ChatWorkspace
                         accent={theme.accent}
@@ -2804,7 +2750,8 @@ function RoomWorkspace({
                         loadMoreLabel={workspace.chatLoadMore}
                         messages={chatMessages}
                         onMarkRead={onMarkChatMessageRead}
-                        onSend={onSendChatMessage}
+                        controller={chatController}
+                        locale={locale}
                         onTyping={onChatTyping}
                         peerTyping={peerTyping}
                         placeholder={workspace.chatPlaceholder}
@@ -2868,33 +2815,6 @@ function RoomWorkspace({
                       <CollaborationWorkspace accent={theme.accent} locale={locale} onFeatureUsed={() => onFeatureUsed("collaborate")} provider={collaborationProvider} />
                     ) : activeWorkspace === "canvas" ? (
                       <CollaborationCanvas accent={theme.accent} key={collaborationProvider?.document.clientID ?? "pending"} locale={locale} onFeatureUsed={() => onFeatureUsed("canvas")} provider={collaborationProvider} />
-                    ) : activeWorkspace === "status" ? (
-                      <div className="flex h-full min-h-0 w-full max-w-2xl flex-col pb-[clamp(6rem,7vh,7rem)] pt-6 lg:max-w-3xl">
-                        <OverlayScrollbar
-                          className="min-h-0 flex-1 px-2 pr-5 [mask-image:linear-gradient(to_bottom,transparent_0%,black_2rem,black_calc(100%-3rem),transparent_100%)]"
-                          syncKey={`${progress.resource.detail}-${progress.websocket.detail}-${progress.p2p.detail}-${progress.dataChannel.detail}`}
-                        >
-                          <div className="flex min-h-full flex-col justify-center py-7">
-                            <div className="px-2">
-                              <div className="flex items-start gap-4">
-                          <Icon aria-hidden="true" className="mt-1 size-8 text-sky-200" />
-                          <div>
-                            <h1 id="connection-ready-title" className="zest-room-heading text-3xl font-bold tracking-[0.04em] text-sky-50">{title}</h1>
-                            <p className="zest-room-copy mt-2 text-sm font-medium tracking-[0.04em] text-sky-100/60">{workspace.statusHint}</p>
-                          </div>
-                        </div>
-                            </div>
-                            <div className="mx-2 mt-8 border-y border-white/10">
-                            <StatusMetric icon={RiGlobalLine} label={roomCopy[locale].resource} locale={locale} status={progress.resource} />
-                            <StatusMetric icon={RiRouterLine} label={roomCopy[locale].websocket} locale={locale} realtimeConnection status={progress.websocket} />
-                            <StatusMetric icon={RiGlobalLine} label={roomCopy[locale].stun} locale={locale} status={progress.stun} />
-                            <StatusMetric icon={RiExchange2Line} label={roomCopy[locale].turn} locale={locale} status={progress.turn} />
-                            <StatusMetric icon={RiWifiLine} label={roomCopy[locale].p2p} locale={locale} realtimeConnection status={progress.p2p} />
-                            <StatusMetric icon={RiRadioButtonLine} label={roomCopy[locale].dataChannel} locale={locale} status={progress.dataChannel} />
-                          </div>
-                          </div>
-                        </OverlayScrollbar>
-                      </div>
                     ) : (
                       <div className="mx-auto max-w-xl text-center">
                         <Icon aria-hidden="true" className="mx-auto size-10 text-sky-200" />
@@ -2910,7 +2830,6 @@ function RoomWorkspace({
             {open && (peerPresence === "solo" || peerPresence === "away") ? (
               <ConnectionStatusCard
                 locale={locale}
-                onRequestLeave={() => setExitDialogOpen(true)}
                 progress={progress}
                 roomId={roomId}
               />
@@ -3030,6 +2949,38 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const [connectionRoute, setConnectionRoute] = useState<ConnectionRoute>("direct");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatComposerState, setChatComposerState] = useState(createEmptyChatComposerState);
+  const chatComposerStateRef = useRef(chatComposerState);
+  const [chatComposerError, setChatComposerError] = useState<string | null>(null);
+  const [chatAssetVersion, setChatAssetVersion] = useState(0);
+  const chatImageStoreRef = useRef<ChatImageAssetStore | null>(null);
+  if (!chatImageStoreRef.current) chatImageStoreRef.current = new ChatImageAssetStore();
+  const chatUploadQueueRef = useRef(new ChatImageUploadQueue());
+  const pendingChatUploadsRef = useRef(new Map<string, PendingChatUpload>());
+  const chatRoomAbortRef = useRef(new AbortController());
+  const changeChatComposerState = (next: ChatComposerState) => {
+    chatComposerStateRef.current = next;
+    setChatComposerState(next);
+    setChatComposerError(null);
+  };
+  useEffect(() => {
+    const store = chatImageStoreRef.current ?? new ChatImageAssetStore();
+    chatImageStoreRef.current = store;
+    const controller = new AbortController();
+    chatRoomAbortRef.current = controller;
+    chatUploadQueueRef.current = new ChatImageUploadQueue();
+    const unsubscribe = store.subscribe(() => setChatAssetVersion((version) => version + 1));
+    setChatAssetVersion((version) => version + 1);
+    return () => {
+      controller.abort();
+      unsubscribe();
+      store.dispose();
+      if (chatImageStoreRef.current === store) chatImageStoreRef.current = null;
+      for (const pending of pendingChatUploadsRef.current.values()) for (const preview of pending.previews) URL.revokeObjectURL(preview.url);
+      pendingChatUploadsRef.current.clear();
+      disposeChatComposerState(chatComposerStateRef.current);
+    };
+  }, [roomId]);
   const [fileTransfers, setFileTransfers] = useState<FileTransferSnapshot[]>([]);
   const usedFeaturesRef = useRef(new Set<MeasuredFeature>());
   const [canvasHasContent, setCanvasHasContent] = useState(false);
@@ -3224,11 +3175,87 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   }, [roomId]);
 
   const updateChatMessages = (update: (messages: ChatMessage[]) => ChatMessage[]) => {
-    setChatMessages((current) => {
-      const next = update(current);
-      chatMessagesRef.current = next;
-      return next;
-    });
+    const next = update(chatMessagesRef.current);
+    chatMessagesRef.current = next;
+    setChatMessages(next);
+  };
+
+  const tryDeliverChatMessage = (session: NativeWebRTCSession, message: ChatMessage): void => {
+    if (message.sender !== "local" || message.deliveryStatus === "received" || message.deliveryStatus === "read" || pendingChatUploadsRef.current.has(message.id)) return;
+    if (message.rich && message.rich.images.some((image) => image.expiresAt <= Date.now())) {
+      updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "图片已过期，请重新选择图片发送。" : "Images expired. Choose them again to send a new copy." } : item));
+      return;
+    }
+    if (message.rich && session.chatImageSupport !== "supported") {
+      if (session.chatImageSupport === "unsupported") updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "对方版本不支持图文消息，请让对方刷新页面后重试。" : "The other participant needs to refresh before receiving images." } : item));
+      return;
+    }
+    const sent = message.rich ? session.sendRichChatMessage(message.rich) : session.sendChatMessage(message.id, message.text);
+    if (sent) updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "sending", lastAttemptedAt: Date.now(), imageError: undefined } : item));
+  };
+
+  const processChatUpload = async (id: string, force = false): Promise<void> => {
+    const pending = pendingChatUploadsRef.current.get(id);
+    const message = chatMessagesRef.current.find((item) => item.id === id);
+    const session = sessionRef.current;
+    if (!pending || !message || pending.running || (!force && message.uploadState === "error")) return;
+    if (!session?.getImageUploadAuthorization()) {
+      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, uploadState: "waiting", imageError: undefined } : item));
+      return;
+    }
+    const signal = chatRoomAbortRef.current.signal;
+    const store = chatImageStoreRef.current;
+    if (signal.aborted || !store) return;
+    pending.running = true;
+    updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, uploadState: "uploading", deliveryStatus: "queued", imageError: undefined } : item));
+    try {
+      const attempts = await Promise.allSettled(pending.draft.images.map(async (image) => {
+        const uploaded = pending.uploaded.get(image.id);
+        if (uploaded) {
+          if (uploaded.expiresAt <= Date.now()) throw new ChatImageRequestError(410);
+          return;
+        }
+        const value = await chatUploadQueueRef.current.upload(roomId, image.file, session, signal);
+        if (signal.aborted) return;
+        const reference = { ...value, width: image.width, height: image.height, name: image.file.name, original: image.original };
+        pending.uploaded.set(image.id, reference);
+        const preview = pending.previews.find((item) => item.id === image.id);
+        if (preview) { preview.image = reference; store.prime(reference, preview.url); }
+        updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, localImages: [...pending.previews], uploadCount: pending.uploaded.size } : item));
+      }));
+      if (signal.aborted) return;
+      const failed = attempts.find((attempt) => attempt.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      const rich: RichChatMessage = {
+        id, type: "chat-rich", version: 1,
+        blocks: pending.draft.blocks.map((block) => block.type === "image" ? { type: "image", imageId: pending.uploaded.get(block.imageId)!.imageId } : block),
+        images: pending.draft.images.map((image) => pending.uploaded.get(image.id)!),
+      };
+      for (const image of pending.draft.images) {
+        const preview = pending.previews.find((item) => item.id === image.id);
+        if (preview) store.prime(pending.uploaded.get(image.id)!, preview.url);
+      }
+      pendingChatUploadsRef.current.delete(id);
+      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, blocks: rich.blocks, images: rich.images, rich, localImages: undefined, uploadState: "complete" } : item));
+      const current = chatMessagesRef.current.find((item) => item.id === id);
+      if (current && sessionRef.current) tryDeliverChatMessage(sessionRef.current, current);
+    } catch (error) {
+      if (signal.aborted) return;
+      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, deliveryStatus: "error", uploadState: "error", imageError: chatImageErrorText(error, locale) } : item));
+    } finally { pending.running = false; }
+  };
+
+  const resumeChatMessages = (session: NativeWebRTCSession): void => {
+    for (const [id] of pendingChatUploadsRef.current) void processChatUpload(id);
+    for (const message of chatMessagesRef.current) tryDeliverChatMessage(session, message);
+  };
+
+  const retryChatMessage = (id: string) => {
+    if (pendingChatUploadsRef.current.has(id)) void processChatUpload(id, true);
+    else {
+      const message = chatMessagesRef.current.find((item) => item.id === id);
+      if (message && sessionRef.current) tryDeliverChatMessage(sessionRef.current, message);
+    }
   };
 
   const updateSharedPlayback = (next: SharedPlayback | null) => {
@@ -3586,16 +3613,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       roomId,
       setProgress,
       () => {
-        const pendingMessages = chatMessagesRef.current.filter((message) => message.sender === "local" && message.deliveryStatus !== "read" && message.deliveryStatus !== "received");
-        const retriedMessageIds = new Set<string>();
-        for (const message of pendingMessages) {
-          if (session.sendChatMessage(message.id, message.text)) retriedMessageIds.add(message.id);
-        }
-        if (retriedMessageIds.size) {
-          updateChatMessages((current) => current.map((message) => retriedMessageIds.has(message.id)
-            ? { ...message, deliveryStatus: "sending", lastAttemptedAt: Date.now() }
-            : message));
-        }
+        resumeChatMessages(session);
         fileManagerRef.current?.onTransportReady();
         if (!connectionReportedRef.current) {
           connectionReportedRef.current = true;
@@ -3634,7 +3652,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           id: message.id,
           sender: "remote",
           sentAt: Date.now(),
-          text: message.text,
+          text: message.type === "chat" ? message.text : message.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n"),
+          ...(message.type === "chat-rich" ? { blocks: message.blocks, images: message.images, rich: message } : {}),
         }));
       },
       (id, status) => {
@@ -3654,6 +3673,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       },
       handleSharedPlaybackMessage,
       (status: SessionStatus) => {
+        if (status.seatState === "confirmed") for (const [id] of pendingChatUploadsRef.current) void processChatUpload(id);
         if (status.p2pState === "connected") {
           peerEverConnectedRef.current = true;
           setPeerPresence("active");
@@ -3708,6 +3728,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       },
     );
     sessionRef.current = session;
+    const unsubscribeChatCapabilities = session.subscribeChatImageSupport(() => resumeChatMessages(session));
     connectionReportedRef.current = false;
     replaceCollaborationProvider(session);
     setMediaTransport(session.media);
@@ -3744,6 +3765,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       if (pageHidden) session.suspend();
       else session.close();
       unsubscribeMedia();
+      unsubscribeChatCapabilities();
       rawMicrophoneTrackRef.current?.stop();
       rawMicrophoneTrackRef.current = null;
       cameraTrackRef.current?.stop();
@@ -3780,6 +3802,11 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   }, [roomId]);
 
   const leave = () => {
+    chatRoomAbortRef.current.abort();
+    chatImageStoreRef.current?.dispose();
+    disposeChatComposerState(chatComposerStateRef.current);
+    for (const pending of pendingChatUploadsRef.current.values()) for (const preview of pending.previews) URL.revokeObjectURL(preview.url);
+    pendingChatUploadsRef.current.clear();
     disposePeerSessionScope();
     sessionRef.current?.close();
     chatMessagesRef.current = [];
@@ -3837,27 +3864,37 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     } };
   };
 
-  const sendChatMessage = (text: string): boolean => {
-    const message = text.trim();
-    if (!message) return false;
+  const sendChatMessage = (draft: ChatComposerSubmit): boolean => {
+    const text = draft.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n");
+    if (!text.trim() && !draft.images.length) return false;
+    if (text.length > 4_000) { setChatComposerError(locale === "zh" ? "消息文字不能超过 4,000 字符。" : "Messages can contain up to 4,000 text characters."); return false; }
+    const session = sessionRef.current;
+    if (draft.images.length && session?.chatImageSupport === "unsupported") {
+      setChatComposerError(locale === "zh" ? "对方版本不支持图文消息，请让对方刷新页面。" : "The other participant needs to refresh before receiving images.");
+      return false;
+    }
     const id = cuid();
-    // With no peer transport the channel send fails; queue the message locally
-    // instead — onConnected resends everything not yet read/received, so it
-    // syncs as soon as someone joins.
-    const delivered = sessionRef.current?.sendChatMessage(id, message) ?? false;
-    updateChatMessages((current) => appendChatMessage(current, {
-      deliveryStatus: delivered ? "sending" : "queued",
-      id,
-      ...(delivered ? { lastAttemptedAt: Date.now() } : {}),
-      sender: "local",
-      sentAt: Date.now(),
-      text: message,
-    }));
+    setChatComposerError(null);
+    if (draft.images.length) {
+      // The editor releases its preview URLs when accepted; the room owns copies.
+      const previews = draft.images.map((image) => ({ id: image.id, url: URL.createObjectURL(image.file), width: image.width, height: image.height, name: image.file.name }));
+      pendingChatUploadsRef.current.set(id, { draft, previews, uploaded: new Map(), running: false });
+      updateChatMessages((current) => appendChatMessage(current, { id, text, blocks: draft.blocks, localImages: previews, sender: "local", sentAt: Date.now(), deliveryStatus: "queued", uploadState: "waiting", uploadCount: 0 }));
+      void processChatUpload(id);
+    } else {
+      const delivered = session?.sendChatMessage(id, text.trim()) ?? false;
+      updateChatMessages((current) => appendChatMessage(current, { id, text: text.trim(), sender: "local", sentAt: Date.now(), deliveryStatus: delivered ? "sending" : "queued", ...(delivered ? { lastAttemptedAt: Date.now() } : {}) }));
+    }
     reportFeatureUsage("chat");
     return true;
   };
 
   const markChatMessageRead = (id: string): boolean => {
+    const message = chatMessagesRef.current.find((item) => item.id === id);
+    if (message?.images?.some((image) => {
+      const state = chatImageStoreRef.current?.snapshot(image).state;
+      return state !== "ready" && state !== "expired";
+    })) return false;
     return sessionRef.current?.markChatMessageRead(id) ?? false;
   };
 
@@ -4298,7 +4335,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           microphonePending={microphonePending}
           noiseReductionActive={noiseReductionActive}
           onMarkChatMessageRead={markChatMessageRead}
-          onSendChatMessage={sendChatMessage}
+          chatController={{ state: chatComposerState, onStateChange: changeChatComposerState, onSend: sendChatMessage, onRetry: retryChatMessage, imageStore: chatImageStoreRef.current!, assetVersion: chatAssetVersion, error: chatComposerError }}
           onToggleNoiseReduction={toggleNoiseReduction}
           onSelectMicrophone={selectMicrophone}
           onToggleMicrophone={toggleMicrophone}

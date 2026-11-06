@@ -2,13 +2,19 @@
 
 ZestSend 是一个开源的 WebRTC 点对点连接网页工具，可自行部署在 Cloudflare 上。
 
-支持端对端加密的匿名实时聊天、文件互传、语音通话、视频通话、屏幕共享、同播共享、文本协作、画板等功能，支持点对点直连或 Cloudflare TURN 中转。
+支持文字与图片混排的实时聊天、文件互传、语音通话、视频通话、屏幕共享、同播共享、文本协作、画板等功能。文字、普通文件和媒体通过 WebRTC 端对端加密传输，支持直连或 Cloudflare TURN 中转。
 
-无任何账号 / 数据记录机制、完全匿名，两位参与者输入相同的四位房间号后即可连接。直接使用 Cloudflare 部署，即可建立点对点直连连接。配置 Cloudflare TURN 服务器后，可每月免费获得 1000GB 中转连接流量。
+聊天图片通过 HTTPS 上传到 Cloudflare 私有 R2 存储，24 小时后过期，**不采用端对端加密**。图片读取需要独立随机凭证，四位房间号本身不能读取图片；部署运营方能够访问云端图片。聊天历史只保存在当前页面内存，刷新或关闭后清空，云端图片不会恢复聊天历史。
+
+无需注册产品账号，两位参与者输入相同的四位房间号后即可连接。服务器保存必要的短期席位、上传额度和临时图片，部署平台也可能产生运行日志；不承诺“无任何数据记录”。图片使用方式、保留期限及部署要求见 [聊天图片与 Cloudflare 配置](docs/cloudflare-chat-images.md)。
 
 延续并改进了 [RavelloH/TimePulse](https://github.com/RavelloH/TimePulse) 的玻璃态设计美学。
 
 ## 部署
+
+本仓库同时使用两个 Cloudflare 账号。检查配置、部署或线上验收前，请先阅读 [双账号部署与验收规则](AGENTS.md)，核对账号、Worker、环境和完整域名。
+
+启用聊天图片前，必须在目标账号创建私有 R2 桶 `zestsend-chat-images`，配置 `CHAT_IMAGES` binding、一天生命周期兜底和小时 Cron；具体步骤见 [图片部署说明](docs/cloudflare-chat-images.md#上线前配置)。部署状态及验证结果需以目标账号的部署记录和验收报告为准。
 
 Fork 本仓库后，在 Cloudflare Dashboard 的 **Workers & Pages** 中依次选择 **Create application** → **Import a repository**，选择自己的 Fork 并完成 GitHub 授权。
 
@@ -51,7 +57,7 @@ Fork 本仓库后，在 Cloudflare Dashboard 的 **Workers & Pages** 中依次�
 
 ## 技术栈
 
-- Cloudflare Workers、Durable Objects、Realtime TURN
+- Cloudflare Workers、Durable Objects、Realtime TURN、私有 R2 临时图片存储
 - Hono、Wrangler、Cloudflare Vite Plugin
 - 原生 WebRTC 的 `RTCPeerConnection`、`RTCDataChannel`、MediaStream
 - React、Vite、TypeScript、Tailwind CSS、TanStack Router
@@ -75,6 +81,8 @@ TURN_TOKEN=your_cloudflare_turn_api_token
 ```
 
 未配置 TURN 时，应用仍会使用公共 STUN 尝试直连；受限网络无法穿透时则不会启用中继。
+
+`pnpm dev` 使用本地模拟的 R2 binding，无需创建真实云桶或填写 R2 S3 密钥；本地图片与云端图片相互独立。本地 Cron 不会自动按小时运行，测试与清理验证方式见 [图片本地开发说明](docs/cloudflare-chat-images.md#本地开发与验证)。
 
 ## 许可证
 

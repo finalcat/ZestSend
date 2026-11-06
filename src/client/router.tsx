@@ -29,7 +29,7 @@ const englishRoomRoute = createRoute({
   path: "/en/room/$roomId",
   component: () => {
     const { roomId } = englishRoomRoute.useParams();
-    return <Room locale="en" roomId={roomId} />;
+    return <Room key={roomId} locale="en" roomId={roomId} />;
   },
   validateSearch: (search: Record<string, unknown>) => search,
 });
@@ -39,7 +39,7 @@ const chineseRoomRoute = createRoute({
   path: "/zh/room/$roomId",
   component: () => {
     const { roomId } = chineseRoomRoute.useParams();
-    return <Room locale="zh" roomId={roomId} />;
+    return <Room key={roomId} locale="zh" roomId={roomId} />;
   },
   validateSearch: (search: Record<string, unknown>) => search,
 });

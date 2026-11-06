@@ -1,0 +1,9 @@
+export const CHAT_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+export const CHAT_IMAGE_TTL_MS = 24 * 60 * 60 * 1000;
+export const CHAT_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"] as const;
+export type ChatImageMimeType = typeof CHAT_IMAGE_MIME_TYPES[number];
+export const CHAT_IMAGE_ID_PATTERN = /^\d{13}-[0-9a-f]{32}$/;
+export const CHAT_IMAGE_MAX_CONCURRENT_UPLOADS = 2;
+export const CHAT_IMAGE_UPLOADS_PER_MINUTE = 20;
+export const CHAT_IMAGE_BYTES_PER_HOUR = 200 * 1024 * 1024;
+export const CHAT_IMAGE_UPLOAD_TIMEOUT_MS = 2 * 60 * 1000;
