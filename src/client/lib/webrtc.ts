@@ -658,6 +658,13 @@ export class NativeWebRTCSession {
   private receivedBytes = 0;
   private sentBytes = 0;
   private receivedChatIds = new Set<string>();
+  // Read receipts are fire-and-forget on the control channel: a send that
+  // returns true can still vanish when the SCTP transport tears down right
+  // after it (common on relayed links). Track acknowledged-read ids so every
+  // control-channel (re)open replays them; the receiving side treats
+  // chat-read as idempotent (status only ever advances).
+  private readonly readReceiptIds: string[] = [];
+  private readonly readReceiptSet = new Set<string>();
   private fileTransferManager: FileTransferManager | null = null;
   private mediaTransport: MediaTransport;
 
@@ -1580,6 +1587,7 @@ export class NativeWebRTCSession {
       this.updateDataChannelProgress();
       if (name === "control") {
         this.announceChatCapabilities(channel);
+        this.flushReadReceipts();
         this.startDataChannelLatencyProbe();
       }
       if (name === "collaboration") this.notifyCollaborationStatus(true);
@@ -1860,7 +1868,20 @@ export class NativeWebRTCSession {
   private sendDataChannelControl(message: DataChannelControlMessage): void { this.sendOnChannel("control", JSON.stringify(message)); }
   markChatMessageRead(id: string): boolean {
     if (!id || id.length > 128) return false;
+    // Remember the receipt even when the channel is closed: the flush on the
+    // next control-channel open is the delivery guarantee, not this send.
+    if (!this.readReceiptSet.has(id)) {
+      this.readReceiptSet.add(id);
+      this.readReceiptIds.push(id);
+      const overflow = this.readReceiptIds.length - 512;
+      if (overflow > 0) for (const evicted of this.readReceiptIds.splice(0, overflow)) this.readReceiptSet.delete(evicted);
+    }
     return this.sendOnChannel("control", JSON.stringify({ id, type: "chat-read" satisfies ChatReceiptMessage["type"] }));
+  }
+  private flushReadReceipts(): void {
+    for (const id of this.readReceiptIds) {
+      this.sendOnChannel("control", JSON.stringify({ id, type: "chat-read" satisfies ChatReceiptMessage["type"] }));
+    }
   }
   sendChatTyping(): boolean { return this.sendOnChannel("control", JSON.stringify({ type: "chat-typing" satisfies ChatTypingMessage["type"] })); }
   private openDataChannelCount(): number { return DATA_CHANNEL_NAMES.filter((name) => this.channels[name]?.readyState === "open").length; }

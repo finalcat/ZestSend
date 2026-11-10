@@ -267,6 +267,50 @@ describe("reply capability compatibility", () => {
     expect(control.send.mock.calls.filter(([payload]) => typeof payload === "string" && JSON.parse(payload).type === "chat-received")).toHaveLength(2);
   });
 
+  it("replays read receipts when the control channel reopens after a silent loss", () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    openChannel(peer, "interactive");
+    expect(session.markChatMessageRead("msg-1")).toBe(true);
+    expect(control.send).toHaveBeenCalledWith(JSON.stringify({ id: "msg-1", type: "chat-read" }));
+    // Relayed links can tear the SCTP transport right after a send that
+    // returned true, losing the receipt. The next control-channel open must
+    // replay every recorded read; receipts queued while the channel was down
+    // ride along instead of being stranded.
+    control.readyState = "closed";
+    expect(session.markChatMessageRead("msg-2")).toBe(false);
+    control.readyState = "open";
+    control.onopen?.();
+    const replayed = control.send.mock.calls
+      .filter(([payload]) => typeof payload === "string" && JSON.parse(payload).type === "chat-read")
+      .map(([payload]) => JSON.parse(payload as string).id);
+    // One optimistic send for msg-1 while open, then the replay covers both.
+    expect(replayed).toEqual(["msg-1", "msg-1", "msg-2"]);
+  });
+
+  it("keeps the read-receipt replay idempotent and bounded", () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    openChannel(peer, "interactive");
+    session.markChatMessageRead("msg-1");
+    session.markChatMessageRead("msg-1");
+    control.readyState = "closed";
+    for (let index = 0; index < 600; index += 1) session.markChatMessageRead(`bulk-${index}`);
+    control.readyState = "open";
+    control.onopen?.();
+    const replayed = control.send.mock.calls
+      .filter(([payload]) => typeof payload === "string" && JSON.parse(payload).type === "chat-read")
+      .map(([payload]) => JSON.parse(payload as string).id);
+    // Two optimistic sends (duplicate calls) but only one queue entry; the
+    // 601-entry queue is trimmed to its 512 cap, evicting msg-1 and the
+    // oldest bulk ids, so the replay starts at bulk-88.
+    expect(replayed.filter((id) => id === "msg-1")).toHaveLength(2);
+    expect(replayed).toHaveLength(514);
+    expect(replayed[2]).toBe("bulk-88");
+  });
+
   it("ignores old channel callbacks and deadlines after peer replacement or suspend", async () => {
     const { session, socket } = start(true);
     const control = openChannel(FakePeer.instances[0], "control");
