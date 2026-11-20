@@ -2,7 +2,6 @@ import {
   RiArrowLeftLine,
   RiAddLine,
   RiArrowDownSLine,
-  RiArrowUpSLine,
   RiCheckboxCircleFill,
   RiCheckDoubleLine,
   RiCheckLine,
@@ -67,7 +66,7 @@ import NumberFlow, { NumberFlowGroup } from "@number-flow/react";
 import { useNavigate } from "@tanstack/react-router";
 import cuid from "cuid";
 import { AnimatePresence, motion } from "framer-motion";
-import { type CSSProperties, type DragEventHandler, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type DragEventHandler, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import * as Y from "yjs";
 
 import Layout from "../components/Layout";
@@ -346,8 +345,7 @@ const roomCopy = {
     soloDescription: "Open Chat to leave messages — they sync automatically once the other participant joins.",
     peerAwayTitle: "The other participant is away",
     peerAwayDescription: "Messages you leave in Chat will sync when they return.",
-    collapseStatus: "Hide connection status",
-    expandStatus: "Show connection status",
+    connectionStatus: "Connection status",
     encrypted: "P2P encrypted · Direct",
     encryptedRelay: "P2P encrypted · Relay",
     leave: "Exit",
@@ -376,8 +374,7 @@ const roomCopy = {
     soloDescription: "进入聊天即可留言，对方加入后将自动同步。",
     peerAwayTitle: "对方暂时离开",
     peerAwayDescription: "留言将在对方回来后自动同步。",
-    collapseStatus: "收起连接状态",
-    expandStatus: "展开连接状态",
+    connectionStatus: "连接状态",
     encrypted: "P2P 加密 · 直连",
     encryptedRelay: "P2P 加密 · 中继",
     leave: "退出",
@@ -686,13 +683,12 @@ function useShareRoom(roomId: string, locale: RoomLocale) {
   return { shareRoom, shareStatus };
 }
 
-// The connection card body shared by the blocking ConnectionDialog and the
-// corner ConnectionStatusCard: room number, optional actions, and the six
-// connection steps.
+// Connection details shared by the blocking dialog and the room header.
 function ConnectionCardDetails({
   error,
   locale,
   onRequestLeave,
+  peerPresence,
   progress,
   roomId,
   showActions = true,
@@ -700,12 +696,24 @@ function ConnectionCardDetails({
   error: string | null;
   locale: RoomLocale;
   onRequestLeave?: () => void;
+  peerPresence?: PeerPresence;
   progress: ConnectionProgress;
   roomId: string;
   showActions?: boolean;
 }) {
   const copy = roomCopy[locale];
   const { shareRoom, shareStatus } = useShareRoom(roomId, locale);
+  const title = error ? copy.connectionErrorTitle
+    : peerPresence === "active" ? copy.ready
+    : peerPresence === "away" ? copy.peerAwayTitle
+    : peerPresence === "solo" ? copy.soloTitle
+    : copy.connectingTitle;
+  const description = shareStatus === "copied" ? copy.copied
+    : error ? localizedDetail(locale, error)
+    : showActions ? copy.preparing(roomId)
+    : peerPresence === "solo" ? (locale === "zh" ? `请让对方输入房间号：${roomId}` : `Ask the other participant to enter room ${roomId}.`)
+    : peerPresence === "away" ? copy.peerAwayDescription
+    : null;
 
   return (
     <>
@@ -713,24 +721,26 @@ function ConnectionCardDetails({
         <div className="min-w-0">
           <p className="text-xs font-bold tracking-[0.12em] text-sky-100/50">{copy.room} {roomId}</p>
           <AutoTransition
-            aria-level={1}
+            aria-level={showActions ? 1 : 2}
             className="mt-2 text-2xl font-bold tracking-[0.04em] text-sky-50 sm:text-3xl"
             duration={0.22}
-            id="connection-title"
+            id={showActions ? "connection-title" : undefined}
             role="heading"
-            transitionKey={error ? "error" : "connecting"}
+            transitionKey={error ? "error" : peerPresence ?? "connecting"}
             type="fade"
           >
-            {error ? copy.connectionErrorTitle : copy.connectingTitle}
+            {title}
           </AutoTransition>
-          <AutoTransition
-            className="mt-2 text-sm font-medium tracking-[0.04em] text-sky-100/60"
-            duration={0.22}
-            transitionKey={shareStatus === "copied" ? "copied" : error ?? "preparing"}
-            type="fade"
-          >
-            {shareStatus === "copied" ? copy.copied : error ? localizedDetail(locale, error) : showActions ? copy.preparing(roomId) : (locale === "zh" ? `请让对方输入房间号：${roomId}` : `Ask the other participant to enter room ${roomId}.`)}
-          </AutoTransition>
+          {description ? (
+            <AutoTransition
+              className="mt-2 text-sm font-medium tracking-[0.04em] text-sky-100/60"
+              duration={0.22}
+              transitionKey={description}
+              type="fade"
+            >
+              {description}
+            </AutoTransition>
+          ) : null}
         </div>
         {showActions ? <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
           <button
@@ -904,18 +914,18 @@ function HeaderConnectionToggle({
       {displayRates ? <DataTransferStats mode="rates" transferred={transferred} /> : (
         <motion.div
           layout="position"
-          className="inline-flex min-w-0 items-center gap-1.5 text-xs font-bold tracking-[0.05em]"
+          className="inline-flex min-w-0 items-center gap-1 text-xs font-bold tracking-[0.05em] sm:gap-1.5"
           transition={{ layout: { duration: 0.32, ease: "easeOut" } }}
         >
-          <RiLock2Fill aria-hidden="true" className="size-4 shrink-0 text-emerald-300" />
+          <RiLock2Fill aria-hidden="true" className="size-3.5 shrink-0 text-emerald-300 sm:size-4" />
           <motion.span layout="position" className="whitespace-nowrap text-emerald-300" transition={{ layout: { duration: 0.32, ease: "easeOut" } }}>
             {connectionRoute === "relay" ? encryptedRelayLabel : encryptedLabel}
           </motion.span>
-          <motion.span layout="position" className="text-slate-400/60" transition={{ layout: { duration: 0.32, ease: "easeOut" } }}>|</motion.span>
-          <motion.span layout="position" className={latency === undefined ? "text-slate-400" : latencyColor(latency, true)} transition={{ layout: { duration: 0.32, ease: "easeOut" } }}>
-            <SignalIcon className="size-4 shrink-0" level={signalLevel(latency)} />
-          </motion.span>
-          <NumberFlowGroup>
+          <span className="inline-flex items-center gap-1.5 max-[374px]:hidden">
+            <span className="text-slate-400/60">|</span>
+            <span className={latency === undefined ? "text-slate-400" : latencyColor(latency, true)}>
+              <SignalIcon className="size-4 shrink-0" level={signalLevel(latency)} />
+            </span>
             <motion.span
               layout="position"
               className={`inline-flex shrink-0 items-baseline font-mono tabular-nums ${latency === undefined ? "text-slate-400" : latencyColor(latency, true)}`}
@@ -924,7 +934,7 @@ function HeaderConnectionToggle({
               {latency === undefined ? <motion.span layout="position">--</motion.span> : <NumberFlow value={Math.round(latency)} willChange />}
               <motion.span layout="position" className="ml-1" transition={{ layout: { duration: 0.32, ease: "easeOut" } }}>ms</motion.span>
             </motion.span>
-          </NumberFlowGroup>
+          </span>
         </motion.div>
       )}
     </motion.span>
@@ -938,7 +948,7 @@ const CHAT_RENDER_LIMIT = 50;
 const CHAT_RENDER_STEP = 50;
 
 // Slim hint above the chat composer while there is no peer transport. The
-// room number lives in the corner ConnectionStatusCard, so
+// room number is already available in the header, so
 // this banner stays text-only.
 function ChatPresenceBanner({ locale, mode }: { locale: RoomLocale; mode: "solo" | "away" }) {
   const workspace = workspaceCopy[locale];
@@ -953,60 +963,96 @@ function ChatPresenceBanner({ locale, mode }: { locale: RoomLocale; mode: "solo"
   );
 }
 
-// The connection card in corner form: same information as the blocking
-// ConnectionDialog (room number and six connection steps), floating
-// top-right over the workspace while no peer transport exists so it never
-// blocks the conversation. Collapses to a slim bar.
-function ConnectionStatusCard({
+function RoomHeaderConnectionControls({
+  connectionRoute,
   locale,
+  peerPresence,
   progress,
   roomId,
 }: {
+  connectionRoute: ConnectionRoute;
   locale: RoomLocale;
+  peerPresence: PeerPresence;
   progress: ConnectionProgress;
   roomId: string;
 }) {
   const copy = roomCopy[locale];
-  const [collapsed, setCollapsed] = useState(false);
-  useEffect(() => {
-    // Keep the expanded progress card from covering the solo chat composer.
-    const focusComposer = (event: FocusEvent) => {
-      if (event.target instanceof HTMLElement && event.target.closest("[data-chat-composer]")) setCollapsed(true);
-    };
-    window.addEventListener("focusin", focusComposer);
-    return () => window.removeEventListener("focusin", focusComposer);
-  }, []);
-  const toggleClassName = "inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-sky-100/60 transition-colors hover:bg-white/[0.06] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60";
+  const [statusOpen, setStatusOpen] = useState(false);
+  const [showRates, setShowRates] = useState(false);
+  const controlsRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelId = useId();
 
-  if (collapsed) {
-    return (
-      <aside aria-label={copy.connectingTitle} className="glass absolute right-0 top-0 z-20 flex items-center gap-1.5 rounded-2xl py-1.5 pl-4 pr-2 text-gray-100 shadow-xl shadow-black/30">
-        <RiTimeLine aria-hidden="true" className="size-4 shrink-0 text-sky-100/60" />
-        <p className="min-w-0 text-xs font-bold tracking-[0.12em] text-sky-100/60">{copy.room} {roomId}</p>
-        <button
-          aria-label={copy.expandStatus}
-          className={toggleClassName}
-          onClick={() => setCollapsed(false)}
-          type="button"
-        >
-          <RiArrowDownSLine aria-hidden="true" className="size-4" />
-        </button>
-      </aside>
-    );
-  }
+  useEffect(() => {
+    if (!statusOpen) return;
+    const dismissOutside = (event: Event) => {
+      if (event.target instanceof Node && !controlsRef.current?.contains(event.target)) setStatusOpen(false);
+    };
+    document.addEventListener("pointerdown", dismissOutside);
+    document.addEventListener("focusin", dismissOutside);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOutside);
+      document.removeEventListener("focusin", dismissOutside);
+    };
+  }, [statusOpen]);
 
   return (
-    <aside aria-label={copy.connectingTitle} className="glass absolute right-0 top-0 z-20 w-[min(23rem,92vw)] origin-top-right scale-[0.88] overflow-hidden rounded-2xl text-gray-100 shadow-xl shadow-black/30">
+    <div
+      className="relative z-30 ml-auto flex max-w-full min-w-0 items-center gap-2 sm:gap-3"
+      onKeyDown={(event) => {
+        if (!statusOpen || event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        setStatusOpen(false);
+        triggerRef.current?.focus();
+      }}
+      ref={controlsRef}
+    >
       <button
-        aria-label={copy.collapseStatus}
-        className="absolute right-1.5 top-1.5 z-10 inline-flex size-7 items-center justify-center rounded-lg text-sky-100/50 transition-colors hover:bg-white/[0.06] hover:text-sky-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60"
-        onClick={() => setCollapsed(true)}
+        aria-controls={panelId}
+        aria-expanded={statusOpen}
+        className="glass inline-flex min-h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-xl px-2 text-xs font-bold tracking-[0.05em] text-[var(--zest-ink-muted)] hover:text-[var(--zest-ink-strong)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60 sm:gap-1.5 sm:px-3"
+        data-room-status-trigger=""
+        onClick={(event) => {
+          event.currentTarget.focus({ preventScroll: true });
+          setStatusOpen((current) => !current);
+        }}
+        ref={triggerRef}
         type="button"
       >
-        <RiArrowUpSLine aria-hidden="true" className="size-4" />
+        <RiTimeLine aria-hidden="true" className="hidden size-4 shrink-0 sm:block" />
+        <span>{copy.room} {roomId}</span>
+        <RiArrowDownSLine aria-hidden="true" className={`size-4 shrink-0 transition-transform ${statusOpen ? "rotate-180" : ""}`} />
       </button>
-      <ConnectionCardDetails error={null} locale={locale} showActions={false} progress={progress} roomId={roomId} />
-    </aside>
+      <Clickable
+        aria-label={showRates ? "Show connection quality" : "Show transfer rates"}
+        className="min-w-0 whitespace-nowrap"
+        data-room-connection-toggle=""
+        hoverScale={1.025}
+        onClick={() => setShowRates((current) => !current)}
+        tapScale={0.98}
+      >
+        <HeaderConnectionToggle
+          connectionRoute={connectionRoute}
+          encryptedLabel={copy.encrypted}
+          encryptedRelayLabel={copy.encryptedRelay}
+          latency={progress.p2p.latency}
+          showRates={showRates}
+          transferred={progress.dataChannel.transferred}
+        />
+      </Clickable>
+      {statusOpen ? (
+        <aside
+          aria-label={copy.connectionStatus}
+          className="glass absolute right-0 top-full mt-2 max-h-[70dvh] w-[min(23rem,calc(100vw-2.5rem))] overflow-y-auto overscroll-contain rounded-2xl text-gray-100 shadow-xl shadow-black/30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-100/60"
+          data-room-status-panel=""
+          id={panelId}
+          tabIndex={0}
+        >
+          <ConnectionCardDetails error={null} locale={locale} peerPresence={peerPresence} progress={progress} roomId={roomId} showActions={false} />
+        </aside>
+      ) : null}
+    </div>
   );
 }
 
@@ -2848,7 +2894,6 @@ function RoomWorkspace({
   const [isExitDialogOpen, setExitDialogOpen] = useState(false);
   const [isSpeakerDialogOpen, setSpeakerDialogOpen] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
-  const [showConnectionRates, setShowConnectionRates] = useState(false);
   const exitTimerRef = useRef<number | null>(null);
   const observedChatMessageCount = useRef(chatMessages.length);
 
@@ -2993,44 +3038,26 @@ function RoomWorkspace({
           className="zest-room-safe relative flex h-full min-h-full flex-1 flex-col p-5 sm:p-8"
           transition={{ duration: 0.28, ease: "easeOut" }}
         >
-          <header className="flex items-center justify-between gap-4">
-            <div className="flex min-w-0 items-baseline gap-2.5">
-              <motion.h1
-                animate={{ opacity: 1, x: 0 }}
-                className="bg-clip-text text-lg font-bold text-transparent sm:text-xl md:text-2xl"
-                initial={{ opacity: 0, x: -20 }}
-                style={{
-                  backgroundImage: `linear-gradient(45deg, ${theme.accent}, ${theme.accent}66)`,
-                  fontFamily: "'Aptos Display', 'Segoe UI', sans-serif",
-                }}
-                transition={{ duration: 0.5 }}
-              >
-                <a
-                  href="https://github.com/RavelloH/ZestSend"
-                  rel="noopener noreferrer"
-                  target="_blank"
-                >
-                  ZestSend
-                </a>
-              </motion.h1>
-              <p className="truncate text-sm font-bold tracking-[0.06em] text-sky-100/65 sm:text-xl"># {roomId}</p>
-            </div>
-            <Clickable
-              aria-label={showConnectionRates ? "Show connection quality" : "Show transfer rates"}
-              className="min-w-0"
-              hoverScale={1.025}
-              onClick={() => setShowConnectionRates((current) => !current)}
-              tapScale={0.98}
+          <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <motion.h1
+              animate={{ opacity: 1, x: 0 }}
+              className="bg-clip-text text-lg font-bold text-transparent sm:text-xl md:text-2xl"
+              initial={{ opacity: 0, x: -20 }}
+              style={{
+                backgroundImage: `linear-gradient(45deg, ${theme.accent}, ${theme.accent}66)`,
+                fontFamily: "'Aptos Display', 'Segoe UI', sans-serif",
+              }}
+              transition={{ duration: 0.5 }}
             >
-              <HeaderConnectionToggle
-                connectionRoute={connectionRoute}
-                encryptedLabel={copy.encrypted}
-                encryptedRelayLabel={copy.encryptedRelay}
-                latency={progress.p2p.latency}
-                showRates={showConnectionRates}
-                transferred={progress.dataChannel.transferred}
-              />
-            </Clickable>
+              <a href="https://github.com/RavelloH/ZestSend" rel="noopener noreferrer" target="_blank">ZestSend</a>
+            </motion.h1>
+            <RoomHeaderConnectionControls
+              connectionRoute={connectionRoute}
+              locale={locale}
+              peerPresence={peerPresence}
+              progress={progress}
+              roomId={roomId}
+            />
           </header>
 
           {connectionNotice ? (
@@ -3150,13 +3177,6 @@ function RoomWorkspace({
                 );
               })()}
             </AutoTransition>
-            {open && (peerPresence === "solo" || peerPresence === "away") ? (
-              <ConnectionStatusCard
-                locale={locale}
-                progress={progress}
-                roomId={roomId}
-              />
-            ) : null}
           </main>
 
           {activeWorkspace !== "video" ? <FloatingVideoSidecars media={media} locale={locale} onFocus={(tileId) => {
