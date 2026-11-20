@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { CHAT_FILE_MAX_BYTES } from "../shared/chat-file-limits";
 import {
   CHAT_IMAGE_BYTES_PER_HOUR, CHAT_IMAGE_MAX_BYTES, CHAT_IMAGE_MAX_CONCURRENT_UPLOADS,
   CHAT_IMAGE_UPLOADS_PER_MINUTE, CHAT_IMAGE_UPLOAD_TIMEOUT_MS,
@@ -76,18 +77,19 @@ const MAX_MESSAGE_BYTES = 128 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const STORAGE_KEY = "room-state-v2";
 const textEncoder = new TextEncoder();
-const IMAGE_QUOTA_KEY = "chat-image-upload-quota-v1";
+// Keep the existing key so both attachment types share the same per-seat budget.
+const ATTACHMENT_QUOTA_KEY = "chat-image-upload-quota-v1";
 
-type ImageUploadReservation = { bytes: number; expiresAt: number; hour: number };
-type ImageUploadQuota = {
+type AttachmentUploadReservation = { bytes: number; expiresAt: number; hour: number };
+type AttachmentUploadQuota = {
   minute: number;
   attempts: number;
   hour: number;
   bytes: number;
-  reservations: Record<string, ImageUploadReservation>;
+  reservations: Record<string, AttachmentUploadReservation>;
 };
 
-export type ImageUploadAdmission =
+type AttachmentUploadAdmission =
   | { ok: true; slotId: string; uploadId: string }
   | { ok: false; status: 401 | 429; retryAfterMs?: number };
 
@@ -205,8 +207,16 @@ export class Room extends DurableObject<Env> {
   }
 
   /** HTTP uploads authenticate an existing seat without renewing or rotating it. */
-  async beginChatImageUpload(resumeToken: string, size: number): Promise<ImageUploadAdmission> {
-    if (!resumeToken || resumeToken.length > 512 || !Number.isInteger(size) || size <= 0 || size > CHAT_IMAGE_MAX_BYTES) {
+  async beginChatImageUpload(resumeToken: string, size: number): Promise<AttachmentUploadAdmission> {
+    return this.reserveChatAttachmentUpload(resumeToken, size, 1, CHAT_IMAGE_MAX_BYTES);
+  }
+
+  async beginChatFileUpload(resumeToken: string, size: number): Promise<AttachmentUploadAdmission> {
+    return this.reserveChatAttachmentUpload(resumeToken, size, 0, CHAT_FILE_MAX_BYTES);
+  }
+
+  private async reserveChatAttachmentUpload(resumeToken: string, size: number, minimum: number, maximum: number): Promise<AttachmentUploadAdmission> {
+    if (!resumeToken || resumeToken.length > 512 || !Number.isSafeInteger(size) || size < minimum || size > maximum) {
       return { ok: false, status: 401 };
     }
     const digest = await tokenHash(resumeToken);
@@ -223,7 +233,7 @@ export class Room extends DurableObject<Env> {
       const leased = slot.connectionId === null && slot.leaseExpiresAt !== null && slot.leaseExpiresAt > now;
       if (!active && !leased) return { ok: false, status: 401 } as const;
 
-      const quotas = await this.ctx.storage.get<Record<string, ImageUploadQuota>>(IMAGE_QUOTA_KEY) ?? {};
+      const quotas = await this.ctx.storage.get<Record<string, AttachmentUploadQuota>>(ATTACHMENT_QUOTA_KEY) ?? {};
       const minute = Math.floor(now / 60_000);
       const hour = Math.floor(now / 3_600_000);
       for (const [id, value] of Object.entries(quotas)) {
@@ -249,14 +259,18 @@ export class Room extends DurableObject<Env> {
       quota.bytes += size;
       quota.reservations[uploadId] = { bytes: size, expiresAt: now + CHAT_IMAGE_UPLOAD_TIMEOUT_MS + 10_000, hour };
       quotas[slot.slotId] = quota;
-      await this.ctx.storage.put(IMAGE_QUOTA_KEY, quotas);
+      await this.ctx.storage.put(ATTACHMENT_QUOTA_KEY, quotas);
       return { ok: true, slotId: slot.slotId, uploadId } as const;
     });
   }
 
   async finishChatImageUpload(slotId: string, uploadId: string, actualBytes: number): Promise<void> {
+    await this.finishChatAttachmentUpload(slotId, uploadId, actualBytes);
+  }
+
+  async finishChatAttachmentUpload(slotId: string, uploadId: string, actualBytes: number): Promise<void> {
     await this.ctx.blockConcurrencyWhile(async () => {
-      const quotas = await this.ctx.storage.get<Record<string, ImageUploadQuota>>(IMAGE_QUOTA_KEY);
+      const quotas = await this.ctx.storage.get<Record<string, AttachmentUploadQuota>>(ATTACHMENT_QUOTA_KEY);
       const quota = quotas?.[slotId];
       const reservation = quota?.reservations[uploadId];
       if (!quotas || !quota || !reservation) return;
@@ -265,7 +279,7 @@ export class Room extends DurableObject<Env> {
       if (quota.hour === reservation.hour) {
         quota.bytes -= reservation.bytes - Math.max(0, Math.min(reservation.bytes, Math.floor(actualBytes) || 0));
       }
-      await this.ctx.storage.put(IMAGE_QUOTA_KEY, quotas);
+      await this.ctx.storage.put(ATTACHMENT_QUOTA_KEY, quotas);
     });
   }
 

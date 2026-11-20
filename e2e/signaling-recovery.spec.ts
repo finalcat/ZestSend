@@ -151,9 +151,32 @@ async function forceIceFailure(page: Page, failAt = 0) {
 async function openChat(page: Page) {
   const composer = page.getByRole("textbox", { name: "Write a message" });
   if (await composer.isVisible().catch(() => false)) return composer;
-  await page.getByRole("button", { name: "Chat" }).click();
+  // exact: substring matching would also hit any future control whose label
+  // merely contains "Chat" (e.g. a split-view toggle).
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(composer).toBeVisible();
   return composer;
+}
+
+function legacyFile(page: Page, name: string) {
+  return page.locator("article:not([data-chat-file-id])").filter({ has: page.getByText(name, { exact: true }) });
+}
+
+async function openLegacyFiles(page: Page) {
+  await page.evaluate(() => { window.location.hash = "#files"; });
+  const choose = page.getByRole("button", { name: "Drop, paste, or choose files", exact: true });
+  await expect(choose).toBeVisible();
+  return choose;
+}
+
+async function offerLegacyFile(page: Page, name: string, buffer: Buffer) {
+  const choose = await openLegacyFiles(page);
+  const [chooser] = await Promise.all([page.waitForEvent("filechooser"), choose.click()]);
+  await chooser.setFiles({
+    name,
+    mimeType: "application/octet-stream",
+    buffer,
+  });
 }
 
 async function dumpTransportLogs(pages: { name: string; page: Page }[]) {
@@ -637,10 +660,10 @@ test.describe("signaling-only interruptions", () => {
       await aliceEditor.fill("Collaboration survives signaling loss");
       await expect(bobEditor).toContainText("Collaboration survives signaling loss");
 
-      await pair.alice.getByRole("button", { name: "Voice" }).click();
+      await pair.alice.evaluate(() => { window.location.hash = "#voice"; });
       await pair.alice.getByRole("button", { name: "Turn microphone on" }).click();
       await expect.poll(async () => (await liveSenderKinds(pair.alice)).audio).toBe(true);
-      await pair.alice.getByRole("button", { name: "Video" }).click();
+      await pair.alice.evaluate(() => { window.location.hash = "#video"; });
       await pair.alice.getByRole("button", { name: "Turn camera on" }).click();
       await expect.poll(async () => (await liveSenderKinds(pair.alice)).video).toBe(true);
 
@@ -678,31 +701,30 @@ test.describe("signaling-only interruptions", () => {
     try {
       const payload = Buffer.alloc(32 * 1024 * 1024, 0x5a);
       const expectedDigest = createHash("sha256").update(payload).digest("hex");
-      await pair.alice.getByRole("button", { name: "Files" }).click();
-      await pair.alice.locator('input[type="file"]:not([accept])').setInputFiles({
-        name: "signaling-resume-integrity.bin",
-        mimeType: "application/octet-stream",
-        buffer: payload,
-      });
-      await pair.bob.getByRole("button", { name: "Files" }).click();
-      await expect(pair.bob.getByRole("button", { name: "Receive" })).toBeVisible({ timeout: 20_000 });
+      const name = "signaling-resume-integrity.bin";
+      await offerLegacyFile(pair.alice, name, payload);
+      await openLegacyFiles(pair.bob);
+      const incoming = legacyFile(pair.bob, name);
+      const receive = incoming.getByRole("button", { name: "Receive", exact: true });
+      await expect(receive).toBeVisible({ timeout: 20_000 });
       const downloadPromise = pair.bob.waitForEvent("download");
-      await pair.bob.getByRole("button", { name: "Receive" }).click();
-      await expect(pair.alice.getByText("Sending", { exact: true })).toBeVisible();
+      await receive.click();
+      await expect(legacyFile(pair.alice, name).getByText("Sending", { exact: true })).toBeVisible();
 
       const alicePeerCount = await peerCount(pair.alice);
-      const offersBeforeReconnect = pair.aliceFrames.filter((frame) => frame.startsWith("sent:signal:offer:")).length;
+      const bobFrameCursor = pair.bobFrames.length;
       await pair.aliceSession.disconnectSignaling(pair.alice);
       await expect(pair.alice.getByRole("status")).toContainText("Signaling is reconnecting");
       await pair.alice.waitForTimeout(1_000);
       await pair.aliceSession.reconnectSignaling();
       const download = await downloadPromise;
-      await expect(pair.bob.getByText("Transfer complete", { exact: true })).toBeVisible({ timeout: 60_000 });
-      await expect.poll(() => pair.aliceFrames.includes("sent:hello:resume-signaling"), { timeout: 20_000 }).toBe(true);
+      await expect(incoming.getByText("Transfer complete", { exact: true })).toBeVisible({ timeout: 60_000 });
+      // Bob's unmodified socket observes the Worker confirming Alice's resumed seat.
+      await expect.poll(() => pair.bobFrames.slice(bobFrameCursor).some((frame) => frame.startsWith("received:peer-reconnected:")), { timeout: 20_000 }).toBe(true);
       await expect(pair.alice.getByRole("status")).toHaveCount(0, { timeout: 20_000 });
       await expect.poll(() => peerCount(pair.alice)).toBe(alicePeerCount);
-      expect(pair.aliceFrames.filter((frame) => frame.startsWith("sent:signal:offer:")).length).toBe(offersBeforeReconnect);
-      expect(download.suggestedFilename()).toBe("signaling-resume-integrity.bin");
+      expect(pair.bobFrames.slice(bobFrameCursor).some((frame) => frame.includes(":signal:offer:"))).toBe(false);
+      expect(download.suggestedFilename()).toBe(name);
       const downloadedPath = await download.path();
       if (!downloadedPath) throw new Error("The browser did not retain the completed download.");
       const downloadedDigest = createHash("sha256").update(await readFile(downloadedPath)).digest("hex");
@@ -722,22 +744,20 @@ test.describe("signaling-only interruptions", () => {
     const roomId = String(Math.floor(1000 + Math.random() * 9000));
     const pair = await createPair(browser, roomId);
     try {
-      await pair.alice.getByRole("button", { name: "Files" }).click();
-      await pair.alice.locator('input[type="file"]:not([accept])').setInputFiles({
-        name: "lease-interruption.bin",
-        mimeType: "application/octet-stream",
-        buffer: Buffer.alloc(32 * 1024 * 1024, 0x5a),
-      });
-      await pair.bob.getByRole("button", { name: "Files" }).click();
-      await expect(pair.bob.getByRole("button", { name: "Receive" })).toBeVisible({ timeout: 20_000 });
-      await pair.bob.getByRole("button", { name: "Receive" }).click();
-      await expect(pair.alice.getByText("Sending", { exact: true })).toBeVisible();
+      const name = "lease-interruption.bin";
+      await offerLegacyFile(pair.alice, name, Buffer.alloc(32 * 1024 * 1024, 0x5a));
+      await openLegacyFiles(pair.bob);
+      const incoming = legacyFile(pair.bob, name);
+      const receive = incoming.getByRole("button", { name: "Receive", exact: true });
+      await expect(receive).toBeVisible({ timeout: 20_000 });
+      await receive.click();
+      await expect(legacyFile(pair.alice, name).getByText("Sending", { exact: true })).toBeVisible();
 
       const alicePeerCount = await peerCount(pair.alice);
       await pair.aliceSession.disconnectSignaling(pair.alice);
-      await pair.alice.getByRole("button", { name: "Chat" }).click();
+      await pair.alice.getByRole("button", { name: "Chat", exact: true }).click();
       await expect(pair.alice.getByRole("status")).toContainText("Signaling is reconnecting");
-      await expect(pair.bob.getByText("Transfer complete", { exact: true })).toBeVisible({ timeout: 60_000 });
+      await expect(incoming.getByText("Transfer complete", { exact: true })).toBeVisible({ timeout: 60_000 });
       await pair.alice.waitForTimeout(36_000);
       await expect(pair.alice.getByRole("status")).toContainText("Verifying the room seat", { timeout: 10_000 });
       await expect.poll(() => peerCount(pair.alice)).toBe(alicePeerCount);

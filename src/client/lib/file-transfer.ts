@@ -496,6 +496,10 @@ export class FileTransferManager {
         this.callbacks.onOffer(this.snapshot(existing));
         return;
       }
+      if (existing?.direction === "incoming" && existing.state === "complete" && existing.size === 0) {
+        this.callbacks.sendControl({ type: "FILE_ACK", transferId: id });
+        return;
+      }
       if (existing) return;
       const fake = new File([], message.name, { type: typeof message.mimeType === "string" ? message.mimeType : "application/octet-stream" });
       const record = asRecord(fake, "incoming", id, this.sessionGeneration);
@@ -557,6 +561,10 @@ export class FileTransferManager {
       this.pumpOutgoing(record);
     } else if (message.type === "FILE_REJECT" || message.type === "CANCEL") {
       this.removeRecord(record);
+    } else if (message.type === "FILE_ACK" && record.direction === "outgoing" && record.size === 0 && record.state !== "complete") {
+      record.state = "complete";
+      record.duration = record.startedAt ? Date.now() - record.startedAt : null;
+      this.emit(record);
     } else if (message.type === "BLOCK_ACK" && record.direction === "outgoing") {
       const blockIndex = Number(message.blockIndex);
       const blockLength = Math.min(FILE_BLOCK_SIZE, record.size - blockIndex * FILE_BLOCK_SIZE);
@@ -652,6 +660,7 @@ export class FileTransferManager {
       this.startTransfer(record);
       this.callbacks.sendControl({ type: "FILE_ACCEPT", transferId: record.id, credit: this.initialCredit(), completedBlocks: [...record.completedBlocks] });
       this.callbacks.sendControl({ type: "FLOW_UPDATE", transferId: record.id, credit: this.initialCredit() });
+      if (record.size === 0) await this.finishIncomingFile(record, generation, signal);
       this.emit(record);
       return true;
     } catch (error) {
@@ -809,27 +818,29 @@ export class FileTransferManager {
       record.receiverBlocks.delete(result.blockIndex);
       this.callbacks.sendControl({ type: "BLOCK_ACK", transferId: record.id, blockIndex: result.blockIndex });
       this.updateRate(record);
-      if (record.confirmedBytes >= record.size) {
-        await this.closeReceiver(record, generation, signal);
-        if (!this.isActiveIncomingTransfer(record, generation, signal)) return;
-        record.state = "complete";
-        record.speed = record.averageSpeed;
-        record.duration = record.startedAt ? Date.now() - record.startedAt : null;
-        const url = await this.createDownloadUrl(record);
-        if (!this.isCurrentRecord(record) || generation !== this.sessionGeneration || signal.aborted) {
-          if (url) URL.revokeObjectURL(url);
-          return;
-        }
-        record.url = url;
-        this.callbacks.sendControl({ type: "FILE_ACK", transferId: record.id });
-        this.downloadFile(record.id);
-      }
+      if (record.confirmedBytes >= record.size) await this.finishIncomingFile(record, generation, signal);
       this.emit(record);
     }).catch((error) => {
       if (isAbortError(error) || !this.isCurrentRecord(record)) return;
       console.error("ZestSend could not write a received file block", error);
       this.fail(record, this.storageErrorMessage(error));
     });
+  }
+
+  private async finishIncomingFile(record: FileRecord, generation: number, signal: AbortSignal): Promise<void> {
+    await this.closeReceiver(record, generation, signal);
+    if (!this.isActiveIncomingTransfer(record, generation, signal)) return;
+    const url = await this.createDownloadUrl(record);
+    if (!this.isActiveIncomingTransfer(record, generation, signal)) {
+      if (url) URL.revokeObjectURL(url);
+      return;
+    }
+    record.url = url;
+    record.state = "complete";
+    record.speed = record.averageSpeed;
+    record.duration = record.startedAt ? Date.now() - record.startedAt : null;
+    this.callbacks.sendControl({ type: "FILE_ACK", transferId: record.id });
+    this.downloadFile(record.id);
   }
 
   private async storagePreflightError(size: number): Promise<string | null> {

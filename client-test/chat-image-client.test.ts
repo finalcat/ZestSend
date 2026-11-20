@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatImageAssetStore, ChatImageRequestError, ChatImageUploadQueue, type ChatImageAuthorization } from "../src/client/lib/chat-image-client";
+import { CHAT_IMAGE_INSPECTION_BYTES, ChatImageMemoryBudget } from "../src/client/lib/chat-images";
 import type { CloudChatImage } from "../src/shared/chat-protocol";
 
 const clock = 1_794_000_000_000;
@@ -15,8 +16,11 @@ function deferred<T>() {
 
 async function settle() { for (let turn = 0; turn < 30; turn += 1) await Promise.resolve(); }
 function controller() { const value = new AbortController(); controllers.push(value); return value; }
-function store() { const value = new ChatImageAssetStore(); stores.push(value); return value; }
-function png(name = "screen shot.png") { return new File([new Uint8Array([137, 80, 78, 71])], name, { type: "image/png" }); }
+function store(budget?: ChatImageMemoryBudget) { const value = new ChatImageAssetStore(budget); stores.push(value); return value; }
+function png(name = "screen shot.png") {
+  const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS8sAAAAASUVORK5CYII=", "base64");
+  return new File([Uint8Array.from(bytes)], name, { type: "image/png" });
+}
 function authorization(): ChatImageAuthorization {
   return { getImageUploadAuthorization: vi.fn(() => "room-token"), waitForImageUploadAuthorization: vi.fn(async () => "rotated-token") };
 }
@@ -163,6 +167,7 @@ describe("room-owned cloud image assets", () => {
     vi.stubGlobal("fetch", fetcher);
     const first = assets.load(image);
     const duplicate = assets.load({ ...image });
+    await settle();
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls[0][0]).toBe(`/api/chat-images/${image.imageId}`);
     const init = fetcher.mock.calls[0][1] as RequestInit;
@@ -193,16 +198,17 @@ describe("room-owned cloud image assets", () => {
   it("revokes an already displayed URL at expiry and does not fetch an expired reference", async () => {
     const assets = store();
     const image = resource(png(), 1, 1_000);
-    const fetcher = vi.fn();
+    const fetcher = vi.fn().mockResolvedValue(imageResponse());
     vi.stubGlobal("fetch", fetcher);
-    assets.prime(image, "blob:preview");
+    await assets.load(image);
+    const url = assets.snapshot(image).url;
     await vi.advanceTimersByTimeAsync(999);
-    expect(assets.snapshot(image)).toEqual({ state: "ready", url: "blob:preview" });
+    expect(assets.snapshot(image)).toMatchObject({ state: "ready", url });
     await vi.advanceTimersByTimeAsync(1);
     expect(assets.snapshot(image)).toEqual({ state: "expired" });
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:preview");
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith(url);
     await assets.load(image, true);
-    expect(fetcher).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("treats a server 410 as expired without automatically fetching the same reference again", async () => {
@@ -235,6 +241,7 @@ describe("room-owned cloud image assets", () => {
     const changed = vi.fn();
     assets.subscribe(changed);
     const loading = assets.load(image);
+    await settle();
     const signal = (fetcher.mock.calls[0][1] as RequestInit).signal!;
     expect(signal.aborted).toBe(false);
     assets.dispose();
@@ -246,22 +253,66 @@ describe("room-owned cloud image assets", () => {
     expect(changed).toHaveBeenCalledTimes(callsAtDisposal);
   });
 
-  it("keeps room-owned primed previews cached and prevents an old load from replacing them", async () => {
+  it("revokes off-screen preview URLs and keeps the presented state for read receipts", async () => {
     const assets = store();
     const image = resource();
-    const pending = deferred<Response>();
-    const fetcher = vi.fn().mockReturnValue(pending.promise);
+    const fetcher = vi.fn().mockResolvedValue(imageResponse());
     vi.stubGlobal("fetch", fetcher);
-    const loading = assets.load(image);
-    assets.prime(image, "blob:room-owned");
-    const cachedLoading = assets.load(image);
-    // A primed asset remains local even though the old aborted request settles later.
-    pending.resolve(imageResponse());
-    await Promise.all([loading, cachedLoading]);
-    expect(assets.snapshot(image)).toEqual({ state: "ready", url: "blob:room-owned" });
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(assets.isReadBlocked(image)).toBe(false);
     expect(URL.createObjectURL).not.toHaveBeenCalled();
-    assets.dispose();
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:room-owned");
+    const release = assets.retain(image);
+    expect(assets.isReadBlocked(image)).toBe(true);
+    await assets.load(image);
+    const url = assets.snapshot(image).url;
+    expect(url).toMatch(/^blob:/);
+    expect(assets.isReadBlocked(image)).toBe(true);
+    assets.markPresented(image);
+    release();
+    expect(assets.snapshot(image)).toEqual({ state: "idle" });
+    expect(assets.isReadBlocked(image, true)).toBe(false);
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith(url);
+    expect(assets.budget.usedBytes).toBe(0);
+  });
+
+  it("serializes preview requests and accounts for fetching alongside draft previews", async () => {
+    const budget = new ChatImageMemoryBudget(CHAT_IMAGE_INSPECTION_BYTES + 500);
+    const assets = store(budget);
+    const first = resource(png(), 1);
+    const second = resource(png(), 2);
+    const pending = deferred<Response>();
+    const fetcher = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValueOnce(imageResponse());
+    vi.stubGlobal("fetch", fetcher);
+
+    const draft = budget.reserve(1_024)!;
+    const releaseFirst = assets.retain(first);
+    await assets.load(first);
+    expect(assets.snapshot(first)).toEqual({ state: "limited" });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(assets.isReadBlocked(first)).toBe(false);
+
+    draft.release();
+    const releaseSecond = assets.retain(second);
+    await settle();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(budget.usedBytes).toBeGreaterThan(CHAT_IMAGE_INSPECTION_BYTES);
+    pending.resolve(imageResponse());
+    await Promise.all([assets.load(first), assets.load(second)]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(budget.usedBytes).toBe((first.size + 4) * 2);
+    releaseFirst();
+    releaseSecond();
+    expect(budget.usedBytes).toBe(0);
+  });
+
+  it("blocks unverified bytes before allocating an image object URL", async () => {
+    const assets = store();
+    const file = new File([new Uint8Array(50)], "not-png.png", { type: "image/png" });
+    const image = resource(file);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(imageResponse(file)));
+    await assets.load(image);
+    expect(assets.snapshot(image)).toEqual({ state: "unavailable" });
+    expect(assets.isReadBlocked(image, true)).toBe(false);
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect(assets.budget.usedBytes).toBe(0);
   });
 });

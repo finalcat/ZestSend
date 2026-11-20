@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHAT_MESSAGE_MAX_BYTES, createChatReply, getChatReplyAuthor, isChatReply, isChatCapabilitiesMessage, isChatReplyCapabilitiesMessage, isCloudChatImage, isInteractiveMessage, isRichChatMessage, type CloudChatImage, type RichChatMessage } from "../src/shared/chat-protocol";
+import { CHAT_FILE_MAX_BYTES, CHAT_MESSAGE_MAX_BYTES, createChatReply, getChatReplyAuthor, isChatReply, isChatCapabilitiesMessage, isChatFileCapabilitiesMessage, isChatReplyCapabilitiesMessage, isCloudChatFile, isCloudChatImage, isInteractiveMessage, isRichChatMessage, type CloudChatFile, type CloudChatImage, type RichChatMessage } from "../src/shared/chat-protocol";
 
 function image(index = 1): CloudChatImage {
   const expiresAt = 1_794_027_600_000;
@@ -152,5 +152,42 @@ describe("message reply snapshots", () => {
       { type: "image", imageId: rich().images[0].imageId },
     ] };
     expect(isRichChatMessage(message)).toBe(false);
+  });
+});
+
+describe("cloud file chat messages", () => {
+  const expiresAt = 1_794_027_600_000;
+  const file: CloudChatFile = { fileId: `${expiresAt}-${"f".repeat(32)}`, expiresAt, name: "世界.zip", size: 0, readToken: "r".repeat(43) };
+  const fileBlock = { type: "file", fileId: file.fileId } as const;
+  const message = { ...rich(), version: 3, files: [file], blocks: [...rich().blocks, fileBlock] };
+
+  it("validates ordered, versioned file references and empty file bytes", () => {
+    expect(isCloudChatFile(file)).toBe(true);
+    expect(isRichChatMessage(message)).toBe(true);
+    expect(isRichChatMessage({ ...message, blocks: [fileBlock], images: [] })).toBe(true);
+    expect(isRichChatMessage({ ...message, version: 1 })).toBe(false);
+    expect(isRichChatMessage({ ...message, files: [] })).toBe(false);
+    expect(isRichChatMessage({ ...message, blocks: [...message.blocks, fileBlock] })).toBe(false);
+    expect(isRichChatMessage({ ...message, blocks: rich().blocks })).toBe(false);
+    expect(isCloudChatFile({ ...file, name: "../bad" })).toBe(false);
+    expect(isCloudChatFile({ ...file, url: "https://example.com" })).toBe(false);
+    expect(isCloudChatFile({ ...file, size: CHAT_FILE_MAX_BYTES + 1 })).toBe(false);
+  });
+
+  it("allows two maximum-size files but rejects more than 100 MiB", () => {
+    const files = ["a", "b", "c"].map((id) => ({ ...file, fileId: `${expiresAt}-${id.repeat(32)}`, size: CHAT_FILE_MAX_BYTES }));
+    for (const count of [2, 3]) {
+      const attachments = files.slice(0, count);
+      const blocks = attachments.map(({ fileId }) => ({ type: "file", fileId }));
+      expect(isRichChatMessage({ ...message, images: [], files: attachments, blocks })).toBe(count === 2);
+    }
+  });
+
+  it("quotes a file-only message by name without its token and negotiates separately", () => {
+    const reply = createChatReply({ id: "file-only", sender: "remote", text: "", blocks: [fileBlock], files: [file] });
+    expect(reply).toEqual({ messageId: "file-only", author: "recipient", text: file.name, imageCount: 0 });
+    expect(isRichChatMessage({ ...message, reply })).toBe(true);
+    expect(isChatFileCapabilitiesMessage({ type: "chat-file-capabilities", version: 1, richFiles: true })).toBe(true);
+    expect(isChatFileCapabilitiesMessage({ type: "chat-capabilities", version: 1, richImages: true })).toBe(false);
   });
 });

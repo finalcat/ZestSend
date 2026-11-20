@@ -166,6 +166,27 @@ body {
   overflow-x: auto;
 }
 
+/* Split panes are narrower than the viewport: centered overflow would clip
+   the leading tools out of scroll reach (same fix as the mobile media
+   query below), so align left inside a split layout. */
+[data-split-pane] .zest-collaboration-tools,
+[data-split-pane] .zest-canvas-tools {
+  justify-content: flex-start;
+}
+
+/* Dragging the split divider must not select text or flip cursors. */
+html.zest-split-dragging,
+html.zest-split-dragging * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.zest-split-divider:focus-visible {
+  outline: 1px solid rgb(125 211 252 / 0.7);
+  outline-offset: -1px;
+  border-radius: 0.25rem;
+}
+
 .zest-collaboration-tool {
   display: inline-flex;
   width: 2.15rem;

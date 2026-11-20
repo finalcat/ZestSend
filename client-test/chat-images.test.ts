@@ -1,10 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  ChatImageError, disposePreparedChatImage, fittedChatImageSize, prepareChatImage, validateChatImageFiles,
+  ChatImageError, ChatImageMemoryBudget, fittedChatImageSize, prepareChatImage, validateChatImageFiles,
 } from "../src/client/lib/chat-images";
 
-function sourceFile(size = 1_000, type = "image/png") {
-  return new File([new Uint8Array(size)], "drawing.png", { type, lastModified: 42 });
+function sourceFile(size = 1_000, width = 4_096, height = 2_048) {
+  // The browser decoding is mocked here. Include the PNG container records
+  // the pre-decode metadata guard needs to validate.
+  const png = new Uint8Array(size);
+  png.set([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  const view = new DataView(png.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  view.setUint32(33, size - 57);
+  png.set([73, 68, 65, 84], 37);
+  png.set([73, 69, 78, 68], size - 8);
+  return new File([png], "drawing.png", { type: "image/png", lastModified: 42 });
 }
 
 function imageBrowser(width = 4_096, height = 2_048, encodedSize = 100) {
@@ -19,8 +29,7 @@ function imageBrowser(width = 4_096, height = 2_048, encodedSize = 100) {
   const createElement = vi.fn(() => canvas);
   vi.stubGlobal("document", { createElement });
   const createUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:prepared-image");
-  const revokeUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
-  return { bitmap, context, canvas, createBitmap, createElement, createUrl, revokeUrl };
+  return { bitmap, context, canvas, createBitmap, createElement, createUrl };
 }
 
 describe("chat image limits", () => {
@@ -57,19 +66,22 @@ describe("chat image preparation", () => {
     expect(browser.canvas.getContext).toHaveBeenCalledWith("2d", { alpha: true });
     expect(browser.canvas.toBlob).toHaveBeenCalledWith(expect.any(Function), "image/webp", 0.82);
     expect(browser.bitmap.close).toHaveBeenCalledOnce();
-    expect(browser.createUrl).toHaveBeenCalledWith(result.file);
-    disposePreparedChatImage(result);
-    expect(browser.revokeUrl).toHaveBeenCalledWith(result.previewUrl);
+    expect(result.decodedBytes).toBe(2_048 * 1_024 * 4);
+    expect(browser.createUrl).not.toHaveBeenCalled();
+    expect(browser.canvas.width).toBe(0);
+    expect(browser.canvas.height).toBe(0);
   });
 
   it.each(["gif", "original"])("preserves source bytes and dimensions for %s", async (mode) => {
     const browser = imageBrowser();
-    const source = sourceFile(1_000, mode === "gif" ? "image/gif" : "image/png");
+    const source = mode === "gif"
+      ? new File([Uint8Array.from(Buffer.from("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b", "hex"))], "animated.gif", { type: "image/gif" })
+      : sourceFile();
     const result = await prepareChatImage(source, { original: mode === "original" });
     expect(result.file).toBe(source);
-    expect(result).toMatchObject({ width: 4_096, height: 2_048, original: true });
+    expect(result).toMatchObject(mode === "gif" ? { width: 1, height: 1, original: true } : { width: 4_096, height: 2_048, original: true });
     expect(browser.createElement).not.toHaveBeenCalled();
-    expect(browser.bitmap.close).toHaveBeenCalledOnce();
+    expect(browser.createBitmap).not.toHaveBeenCalled();
   });
 
   it("retains the original file when encoding makes it larger", async () => {
@@ -87,6 +99,7 @@ describe("chat image preparation", () => {
     const controller = new AbortController();
     const preparation = prepareChatImage(sourceFile(), { signal: controller.signal });
     const rejected = expect(preparation).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(browser.createBitmap).toHaveBeenCalledOnce());
     controller.abort();
     finish(browser.bitmap);
     await rejected;
@@ -114,5 +127,28 @@ describe("chat image preparation", () => {
     browser.createBitmap.mockRejectedValue(new Error("bad image bytes"));
     await expect(prepareChatImage(sourceFile())).rejects.toThrowError(new ChatImageError("decode-failed"));
     expect(browser.createUrl).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized decode before opening an image decoder", async () => {
+    const browser = imageBrowser();
+    await expect(prepareChatImage(sourceFile(1_000, 4_096, 4_096))).rejects.toMatchObject({ code: "image-too-large-to-preview" });
+    await expect(prepareChatImage(sourceFile(1_000, 8_193, 1), { original: true })).rejects.toMatchObject({ code: "image-too-large-to-preview" });
+    expect(browser.createBitmap).not.toHaveBeenCalled();
+    expect(browser.createUrl).not.toHaveBeenCalled();
+  });
+
+  it("serializes room preparation and releases the shared working budget", async () => {
+    const browser = imageBrowser();
+    const budget = new ChatImageMemoryBudget();
+    let finish: (bitmap: typeof browser.bitmap) => void = () => undefined;
+    browser.createBitmap.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const first = prepareChatImage(sourceFile(), { budget });
+    const second = prepareChatImage(sourceFile(), { budget });
+    await vi.waitFor(() => expect(browser.createBitmap).toHaveBeenCalledOnce());
+    expect(budget.usedBytes).toBeGreaterThan(32 * 1_024 * 1_024);
+    finish(browser.bitmap);
+    await Promise.all([first, second]);
+    expect(browser.createBitmap).toHaveBeenCalledTimes(2);
+    expect(budget.usedBytes).toBe(0);
   });
 });

@@ -89,6 +89,11 @@ async function editor(page: Page) {
   await expect(input).toBeEditable();
   return input;
 }
+
+async function openLegacyFiles(page: Page) {
+  await page.goto(new URL("#files", page.url()).href);
+  await expect(page.getByRole("button", { name: "Drop, paste, or choose files", exact: true })).toBeVisible();
+}
 const entry = (page: Page, id: string) => page.locator("[data-chat-entry-id]").filter({ has: page.locator(`[data-chat-reply-target="${id}"]`) });
 const message = (page: Page, text: string) => page.locator("[data-chat-entry-id]").filter({ hasText: text });
 async function send(page: Page, text: string) { const input = await editor(page); await input.fill(text); await input.press("Enter"); }
@@ -163,7 +168,7 @@ test("replaces and cancels a reply without clearing image drafts, workspace chan
   await alice.getByLabel("Choose images", { exact: true }).setInputFiles(image());
   await expect(input.locator("img")).toHaveCount(1);
   await expect(input.locator('[role="status"]')).toHaveCount(0);
-  await alice.getByRole("button", { name: "Files", exact: true }).click();
+  await openLegacyFiles(alice);
   input = await editor(alice);
   await expect(input).toContainText("preserved-draft");
   await expect(input.locator("img")).toHaveCount(1);
@@ -266,7 +271,7 @@ test("retries a quoted image upload once, deduplicates delivery and keeps the sn
   expect((await latestReply(alice))?.reply).toEqual(snapshot);
   const readCount = reads.length;
   await bob.clock.setFixedTime(Date.now() + 24 * 60 * 60 * 1000 + 60_000);
-  await bob.getByRole("button", { name: "Files", exact: true }).click(); await editor(bob);
+  await openLegacyFiles(bob); await editor(bob);
   await expect(received.getByText("Image expired", { exact: true })).toBeVisible();
   await expect(received.locator(`[data-chat-reply-target="${originalId}"]`)).toContainText("image-source");
   await expect(received.locator("[data-chat-reply-target] img")).toHaveCount(0);

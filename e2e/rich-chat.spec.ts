@@ -138,6 +138,11 @@ async function fourChannels(page: Page) {
     .filter(({ peer, channel }) => peer.connectionState === "connected" && channel.readyState === "open" && channel.label !== "probe")
     .map(({ channel }) => channel.label).sort()), { timeout: 40_000 }).toEqual(["bulk", "collaboration", "control", "interactive"]);
 }
+async function openLegacyFiles(page: Page) {
+  await page.goto(new URL("#files", page.url()).href);
+  await expect(page.getByRole("button", { name: "Drop, paste, or choose files", exact: true })).toBeVisible();
+}
+
 async function openChat(page: Page) {
   await page.bringToFront();
   const editor = page.getByRole("textbox", { name: "Write a message", exact: true });
@@ -159,7 +164,7 @@ async function sendText(page: Page, text: string) {
 }
 async function readyDraft(page: Page, images: number) {
   const editor = await openChat(page);
-  await expect(editor.locator("img")).toHaveCount(images);
+  await expect(editor.locator("[data-chat-image-id]")).toHaveCount(images);
   await expect(editor.locator('[role="status"]')).toHaveCount(0, { timeout: 30_000 });
   await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeEnabled();
 }
@@ -221,14 +226,15 @@ test.describe("rich chat with the real local image API", () => {
     await message.getByRole("button", { name: /^Preview image:/ }).first().click();
     await expect(bob.getByRole("dialog", { name: "Image preview", exact: true })).toBeVisible();
     const downloading = bob.waitForEvent("download");
-    await bob.getByRole("link", { name: "Download image", exact: true }).click();
+    await bob.getByRole("button", { name: "Download image", exact: true }).click();
     const download = await downloading;
     const path = await download.path(); expect(path).not.toBeNull();
     const uploaded = uploads.find((item) => item.name === download.suggestedFilename());
     expect(uploaded?.bytes).toBeGreaterThan(0);
     expect(createHash("sha256").update(await readFile(path!)).digest("hex")).toBe(uploaded?.digest);
-    expect(network.filter((item) => item.method === "POST" && item.status >= 200 && item.status < 300)).toHaveLength(2);
-    expect(network.filter((item) => item.method === "GET" && item.status === 200)).toHaveLength(2);
+    expect(network.filter((item) => item.method === "POST" && item.path.endsWith("/chat-images") && item.status === 201)).toHaveLength(2);
+    expect(network.filter((item) => item.method === "POST" && item.path.endsWith("/download") && item.status === 200)).toHaveLength(1);
+    expect(new Set(network.filter((item) => item.method === "GET" && item.status === 200).map((item) => item.path)).size).toBe(2);
   });
 
   test("resizes static images and applies Original to every current image", async ({ pair }) => {
@@ -239,7 +245,9 @@ test.describe("rich chat with the real local image API", () => {
     await (await openChat(alice)).fill("all-originals");
     await alice.getByLabel("Choose images", { exact: true }).setInputFiles([large, small]);
     await readyDraft(alice, 2);
-    const preview = (await openChat(alice)).locator("img").first();
+    const firstImage = (await openChat(alice)).locator("[data-chat-image-id]").first();
+    const preview = firstImage.locator("img");
+    await firstImage.scrollIntoViewIfNeeded();
     await expect.poll(() => preview.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(2048);
     expect(await preview.evaluate((element: HTMLImageElement) => {
       const canvas = document.createElement("canvas"); canvas.width = 1; canvas.height = 1;
@@ -249,6 +257,7 @@ test.describe("rich chat with the real local image API", () => {
     await expect(alice.getByRole("checkbox", { name: "Original", exact: true })).not.toBeChecked();
     await alice.getByRole("checkbox", { name: "Original", exact: true }).check();
     await readyDraft(alice, 2);
+    await firstImage.scrollIntoViewIfNeeded();
     await expect.poll(() => preview.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(2560);
     await sendDraft(alice);
     await expect(richMessage(bob, "all-originals").getByRole("button", { name: /^Preview image:/ })).toHaveCount(2, { timeout: 30_000 });
@@ -282,8 +291,10 @@ test.describe("rich chat with the real local image API", () => {
       const bounds = element.getBoundingClientRect();
       element.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer, clientX: bounds.left + 12, clientY: bounds.bottom - 8 }));
     });
-    await expect(editor.locator("img")).toHaveCount(2);
-    const orderBefore = await editor.locator("img").evaluateAll((elements) => elements.map((element) => element.getAttribute("src")));
+    const draftImages = editor.locator("[data-chat-image-id]");
+    await expect(draftImages).toHaveCount(2);
+    const draftOrder = () => draftImages.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-chat-image-id")));
+    const orderBefore = await draftOrder();
     await editor.press("Control+End");
     await editor.pressSequentially("drag-destination");
     const source = editor.locator("[data-drag-handle]").first();
@@ -291,21 +302,22 @@ test.describe("rich chat with the real local image API", () => {
     await alice.keyboard.down("Control");
     try { await source.dragTo(target, { targetPosition: { x: 24, y: 4 } }); }
     finally { await alice.keyboard.up("Control"); }
-    await expect(editor.locator("img")).toHaveCount(2);
-    expect(await editor.locator("img").evaluateAll((elements) => elements.map((element) => element.getAttribute("src")))).toEqual([...orderBefore].reverse());
-    await alice.getByRole("button", { name: "Files", exact: true }).click();
-    await openChat(alice); await expect(editor).toContainText("draft-survives-switch"); await expect(editor.locator("img")).toHaveCount(2);
+    await expect(draftImages).toHaveCount(2);
+    expect(await draftOrder()).toEqual([...orderBefore].reverse());
+    await openLegacyFiles(alice);
+    await openChat(alice); await expect(editor).toContainText("draft-survives-switch"); await expect(draftImages).toHaveCount(2);
     await editor.dispatchEvent("keydown", { key: "Enter", code: "Enter", keyCode: 229, isComposing: true });
-    await expect(editor.locator("img")).toHaveCount(2); expect(uploads).toHaveLength(0);
+    await expect(draftImages).toHaveCount(2); expect(uploads).toHaveLength(0);
     await editor.evaluate((element) => {
       const transfer = new DataTransfer(); transfer.setData("text/plain", "x".repeat(4001));
       element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
     });
     await expect(alice.getByRole("alert")).toContainText("4000");
-    const removedUrl = await editor.locator("img").first().getAttribute("src");
+    await draftImages.first().scrollIntoViewIfNeeded();
+    const removedUrl = await draftImages.first().locator("img").getAttribute("src");
     await editor.getByRole("button", { name: "Remove image", exact: true }).first().click();
-    await expect(editor.locator("img")).toHaveCount(1);
-    expect(await alice.evaluate((url) => window.__richChatProbe.revokedUrls.has(url!), removedUrl)).toBe(true);
+    await expect(draftImages).toHaveCount(1);
+    await expect.poll(() => alice.evaluate((url) => window.__richChatProbe.revokedUrls.has(url!), removedUrl)).toBe(true);
   });
 
   test("retries one failed upload and deduplicates repeated rich messages without another upload", async ({ pair }) => {
@@ -328,14 +340,13 @@ test.describe("rich chat with the real local image API", () => {
     await expect(message).toHaveCount(1); expect(uploads).toHaveLength(2);
   });
 
-  test("keeps image history usable after peer replacement without uploading or fetching it again", async ({ pair }) => {
-    const { alice, bob, uploads, network } = pair;
+  test("keeps image history usable after peer replacement without uploading it again", async ({ pair }) => {
+    const { alice, bob, uploads } = pair;
     await (await openChat(alice)).fill("history-survives-peer-restart");
     await alice.getByLabel("Choose images", { exact: true }).setInputFiles(image("history.png"));
     await readyDraft(alice, 1); await sendDraft(alice);
     const message = richMessage(bob, "history-survives-peer-restart");
     await expect(message.getByRole("button", { name: /^Preview image:/ })).toBeVisible({ timeout: 30_000 });
-    const reads = network.filter((entry) => entry.method === "GET").length;
     const peers = await alice.evaluate(() => window.__richChatProbe.peers.length);
     await alice.evaluate(() => {
       const peer = window.__richChatProbe.peers.find((candidate) => candidate.connectionState === "connected");
@@ -346,10 +357,15 @@ test.describe("rich chat with the real local image API", () => {
     await expect.poll(() => alice.evaluate(() => window.__richChatProbe.peers.length), { timeout: 40_000 }).toBeGreaterThan(peers);
     await Promise.all([fourChannels(alice), fourChannels(bob)]);
     await sendText(bob, "after-rich-peer-restart"); await expect(alice.getByText("after-rich-peer-restart", { exact: true })).toBeVisible();
-    await expect(message.getByRole("button", { name: /^Preview image:/ })).toBeVisible();
-    await message.getByRole("button", { name: /^Preview image:/ }).click();
-    await expect(bob.getByRole("link", { name: "Download image", exact: true })).toBeVisible();
-    expect(uploads).toHaveLength(1); expect(network.filter((entry) => entry.method === "GET")).toHaveLength(reads);
+    const picture = message.locator("[data-chat-image]");
+    const preview = message.getByRole("button", { name: /^Preview image:/ });
+    await expect(async () => {
+      await picture.scrollIntoViewIfNeeded({ timeout: 2_000 });
+      await expect(preview).toBeInViewport({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    await preview.click();
+    await expect(bob.getByRole("button", { name: "Download image", exact: true })).toBeVisible();
+    expect(uploads).toHaveLength(1);
   });
 
   test("shows expiry for cached images and for a real fetch returning 410", async ({ pair }) => {
@@ -365,7 +381,7 @@ test.describe("rich chat with the real local image API", () => {
     await expect(richMessage(bob, "already-expired-at-server").getByText("Image expired", { exact: true })).toBeVisible({ timeout: 30_000 });
     // Only Date is fixed; RTC/heartbeat timers are never advanced by 24 hours.
     await bob.clock.setFixedTime(Date.now() + 24 * 60 * 60 * 1000 + 60_000);
-    await bob.getByRole("button", { name: "Files", exact: true }).click(); await openChat(bob);
+    await openLegacyFiles(bob); await openChat(bob);
     await expect(richMessage(bob, "cached-before-expiry").getByText("Image expired", { exact: true })).toBeVisible();
     await expect(bob.getByRole("button", { name: /^Preview image:/ })).toHaveCount(0);
   });

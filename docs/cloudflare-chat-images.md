@@ -1,19 +1,21 @@
-# 聊天图片与 Cloudflare 配置
+# 聊天附件与 Cloudflare 配置
 
-聊天图片使用 HTTPS 和私有 Cloudflare R2 临时存储；文字、普通文件、通话等继续使用 WebRTC。仓库配置已加入图片能力。部署时必须先核对目标账号的私有桶、生命周期与 Worker binding；实际部署状态以该目标的验收记录为准。本地测试通过不代表生产站点已经可用。
+聊天图片和普通附件使用 HTTPS 和私有 Cloudflare R2 临时存储。文字、旧文件页的点对点传输及通话继续使用 WebRTC。部署前核对目标账号的私有桶、生命周期与 Worker binding，实际部署状态以该目标的验收记录为准。
 
 ## 数据流与保留期限
 
 | 内容 | 传输与保存方式 |
 | --- | --- |
-| 文字、普通文件、语音、视频及其他 WebRTC 功能 | WebRTC 端对端加密；可直连或经过 TURN 中继 |
-| 聊天图片 | HTTPS 上传至私有 R2，再通过 Worker 凭证鉴权读取；不采用端对端加密，部署运营方能够访问图片 |
-| 图文消息正文与图片读凭证 | 通过双方 WebRTC 聊天通道发送；图片引用就绪后才发送正文 |
+| 文字、旧文件页的点对点传输、语音、视频 | WebRTC 端对端加密，可直连或经过 TURN 中继 |
+| 聊天图片与普通附件 | 通过 HTTPS 上传至私有 R2，由 Worker 鉴权读取。部署运营方能够访问云端附件 |
+| 富文本消息正文与读凭证 | 附件就绪后，通过双方 WebRTC 聊天通道发送 |
 | 聊天历史与预览缓存 | 当前页面内存；刷新或关闭后清空，不从 R2 恢复历史 |
 
 图片支持选图、粘贴和拖拽，按文字段落和图片块混排。Enter 发送，Shift+Enter 换行；默认尝试自动压缩，可选择原图。支持 JPEG、PNG、WebP、GIF，单张源文件及上传文件不超过 20 MiB，单条消息最多 10 张、合计不超过 50 MiB。默认压缩最长边为 2048 像素，尝试 WebP 编码；GIF 保持动画，压缩未能减小文件时保留原文件。
 
-服务端在接收上传时生成固定的 24 小时截止时间。上传后未发送、发送前删除草稿或丢失响应的图片同样按原截止时间清理；重连、查看及消息重发不会续期。图片到期后，Worker 读取接口返回 HTTP 410，页面显示“图片已过期”。已经下载或保存到接收方设备的副本无法撤回。
+普通附件在光标处插入，和文字及图片一起发送。单个文件不超过 50 MiB，单条消息的普通附件合计不超过 100 MiB。发送方有有效席位即可开始上传，消息在当前页面等待对方加入。
+
+服务端在接收上传时生成固定的 24 小时截止时间。已经上传的附件按原截止时间清理，包括消息尚未送达或上传响应丢失的情况。重连、查看及消息重发不影响截止时间。附件到期后，Worker 返回 HTTP 410。接收方存到设备的副本由接收方管理。
 
 “24 小时过期”是访问截止时间。物理删除由小时 Cron 执行，通常在后续整点完成；R2 一天生命周期是清理失败时的兜底，不保证精确到时删除。Cloudflare 说明生命周期删除存在延迟，详见 [R2 对象生命周期](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)。
 
@@ -27,7 +29,11 @@
 
 `GET /api/chat-images/:imageId` 使用独立的 `Authorization: Bearer <readToken>` 读取图片，不凭四位房间号或房间成员身份放行。读凭证由 32 字节随机值生成，服务端仅保存其 hash。客户端通过 fetch 取得 Blob 后生成预览 URL，不将读凭证放入图片链接、查询参数或日志。图片响应及接口错误使用 `Cache-Control: private, no-store`，不经过公开 R2 域名或公开 CDN 缓存。
 
-上传额度按房间稳定席位计算：最多 2 个并发上传、每分钟 20 次上传申请、每小时 200 MiB。额度在 DO 中原子预留，完成或失败后释放并发占用；重新建立同一席位的 WebSocket 不重置额度。此限额不能替代部署方对整体资源用量和费用的监控。
+`POST /api/rooms/:roomId/chat-files` 与图片上传共享席位鉴权。请求使用原始文件和 `X-File-Name: encodeURIComponent(name)`，Worker 校验实际长度并流式写入 `chat-files/`。成功响应包含 `fileId`、`readToken`、`expiresAt`、`name` 和 `size`。
+
+原生下载向 `POST /api/chat-files/:fileId/download` 或 `POST /api/chat-images/:imageId/download` 提交同源表单。表单体携带读凭证，Worker 鉴权后以流式附件响应交给浏览器下载管理器。
+
+图片与普通附件按房间席位共用额度。每个席位最多 2 个并发上传，每分钟 20 次上传申请，每小时 200 MiB。额度在 DO 中原子预留，完成或失败后释放并发占用。重新建立同一席位的 WebSocket 沿用当前额度。
 
 resumeToken 会随信令恢复轮换。鉴权成功的在途上传继续完成；新请求使用旧 token 会返回 401，客户端等待最新 welcome 后重试一次。席位过期但 P2P 仍健康时，文字通道和未过期图片读取可继续使用；新图片上传需要先恢复有效席位。图片过期、读取凭证错误、超限和上传失败均不清空聊天正文。
 
@@ -56,10 +62,11 @@ Worker 测试使用本地 R2 和真实 DO 测试运行时，覆盖席位鉴权�
 
 1. 核对 **Account ID、Worker、环境、完整域名**，检查当前提交、线上版本及 GitHub 自动部署状态。CLI 使用任务范围的 `CLOUDFLARE_ACCOUNT_ID` 或已确认的认证 profile，操作结束恢复原设置；不要永久改变全局登录目标。两个账号的桶和绑定各自独立。
 2. 在目标账号创建 R2 桶 `zestsend-chat-images`。关闭 `r2.dev` 公开访问，不绑定公开自定义域名。桶供 Worker binding 访问，浏览器始终调用 Worker HTTPS API。
-3. 在该桶的生命周期设置中，为前缀 `chat-images/` 添加 **一天后删除对象**的规则。若使用 CLI，先核对账号，再按本仓库 Wrangler 支持的命令执行：
+3. 在该桶的生命周期设置中，为 `chat-images/` 与 `chat-files/` 分别配置 **一天后删除对象**的规则。若使用 CLI，先核对账号，再添加缺失的规则。
 
    ```bash
    pnpm exec wrangler r2 bucket lifecycle add zestsend-chat-images chat-images-1-day chat-images/ --expire-days 1
+   pnpm exec wrangler r2 bucket lifecycle add zestsend-chat-images chat-files-1-day chat-files/ --expire-days 1
    ```
 
    也可通过目标账号的 Dashboard 添加该规则。已有生命周期规则需保留，不能为添加图片规则覆盖其他规则。

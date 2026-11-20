@@ -71,12 +71,15 @@ import { type CSSProperties, type DragEventHandler, type ReactNode, useEffect, u
 import * as Y from "yjs";
 
 import Layout from "../components/Layout";
-import { ChatComposer, createEmptyChatComposerState, disposeChatComposerState, type ChatComposerState, type ChatComposerSubmit } from "../components/chat-composer";
-import { ChatImageMessage, type LocalChatImagePreview } from "../components/chat-image-message";
+import { ChatComposer, createEmptyChatComposerState, type ChatComposerState, type ChatComposerSubmit } from "../components/chat-composer";
+import { ChatFileMessage, type LocalChatFile } from "../components/chat-file-message";
+import { CHAT_IMAGE_MIN_VISIBLE_RATIO, ChatImageMessage, type LocalChatImagePreview } from "../components/chat-image-message";
 import { ChatReplyCard } from "../components/chat-reply-card";
 import { ChatImageAssetStore, ChatImageUploadQueue, ChatImageRequestError, chatImageErrorText } from "../lib/chat-image-client";
 import type { PreparedChatImage } from "../lib/chat-images";
-import { createChatReply, type ChatReply, type ChatBlock, type CloudChatImage, type RichChatMessage } from "../../shared/chat-protocol";
+import { createChatReply, isRichChatMessage, type ChatReply, type ChatBlock, type CloudChatFile, type CloudChatImage, type RichChatMessage } from "../../shared/chat-protocol";
+import { CHAT_FILE_MAX_BYTES, CHAT_FILES_MAX_BYTES, CHAT_ROOM_PENDING_FILE_BYTES, isChatFileName } from "../../shared/chat-file-limits";
+import { formatWorkspaceHash, parseWorkspaceHash, type SplitSideWorkspace, type WorkspaceId } from "../../shared/workspace-hash";
 import { CollaborationCanvas } from "../components/collaboration-canvas";
 import { CollaborationWorkspace } from "../components/collaboration-editor";
 import { useTheme } from "../components/theme";
@@ -85,6 +88,7 @@ import { Clickable } from "../components/ui/clickable";
 import { Dialog, DialogClose, DialogContent } from "../components/ui/dialog";
 import { MagneticDock, type DockItemData } from "../components/ui/magnetic-dock";
 import { OverlayScrollbar } from "../components/ui/overlay-scrollbar";
+import { readStoredSplitRatio, SplitDivider, storeSplitRatio } from "../components/ui/split-divider";
 import { FileTransferManager, type FileTransferDiagnostics, type FileTransferSnapshot } from "../lib/file-transfer";
 import { trackInsightEvent } from "../lib/insightflare";
 import type { MediaTransport } from "../lib/media-transport";
@@ -114,10 +118,13 @@ type ChatMessage = {
   blocks?: ChatBlock[];
   images?: CloudChatImage[];
   localImages?: LocalChatImagePreview[];
+  files?: CloudChatFile[];
+  localFiles?: LocalChatFile[];
   rich?: RichChatMessage;
   reply?: ChatReply;
-  uploadState?: "waiting" | "uploading" | "complete" | "error";
+  uploadState?: "waiting" | "uploading" | "complete" | "error" | "expired" | "invalid";
   uploadCount?: number;
+  uploadTotal?: number;
   imageError?: string;
   sender: "local" | "remote";
   sentAt: number;
@@ -134,19 +141,76 @@ type ChatController = {
   error: string | null;
 };
 type PendingChatUpload = {
-  draft: ChatComposerSubmit;
-  previews: LocalChatImagePreview[];
-  uploaded: Map<string, CloudChatImage>;
+  blocks: ChatBlock[];
+  reply?: ChatReply;
+  images: Map<string, Omit<PreparedChatImage, "sourceFile">>;
+  files: Map<string, File>;
+  uploadedImages: Map<string, CloudChatImage>;
+  uploadedFiles: Map<string, CloudChatFile>;
   running: boolean;
 };
 
+function attachmentState(pending: PendingChatUpload) {
+  const images: CloudChatImage[] = [];
+  const files: CloudChatFile[] = [];
+  const blocks = pending.blocks.map((block): ChatBlock => {
+    if (block.type === "image") {
+      const image = pending.uploadedImages.get(block.imageId);
+      if (image) {
+        images.push(image);
+        return { type: "image", imageId: image.imageId };
+      }
+    }
+    if (block.type === "file") {
+      const file = pending.uploadedFiles.get(block.fileId);
+      if (file) {
+        files.push(file);
+        return { type: "file", fileId: file.fileId };
+      }
+    }
+    return block;
+  });
+  return {
+    blocks,
+    images,
+    files,
+    localImages: [...pending.images.values()].map(({ id, file, decodedBytes, width, height }): LocalChatImagePreview => ({ id, file, decodedBytes, width, height, name: file.name })),
+    localFiles: [...pending.files].map(([id, { name, size }]): LocalChatFile => ({ id, name, size })),
+    uploadCount: pending.uploadedImages.size + pending.uploadedFiles.size,
+  };
+}
+
+function cloudFileMessageFits(draft: ChatComposerSubmit, id: string): boolean {
+  // R2 replaces local IDs and adds fixed-length credentials. Check the wire shape before uploading.
+  const expiresAt = 1_000_000_000_000;
+  const readToken = "a".repeat(43);
+  const cloudId = (index: number) => `${expiresAt}-${index.toString(16).padStart(32, "0")}`;
+  const images: CloudChatImage[] = draft.images.map((image, index) => ({
+    imageId: cloudId(index), readToken, expiresAt, name: image.file.name, size: image.file.size,
+    mimeType: image.file.type as CloudChatImage["mimeType"], width: image.width, height: image.height, original: image.original,
+  }));
+  const files: CloudChatFile[] = draft.files.map(({ file }, index) => ({
+    fileId: cloudId(images.length + index), readToken, expiresAt, name: file.name, size: file.size,
+  }));
+  const imageIds = new Map(draft.images.map((image, index) => [image.id, images[index].imageId]));
+  const fileIds = new Map(draft.files.map((file, index) => [file.id, files[index].fileId]));
+  const blocks = draft.blocks.map((block): ChatBlock => {
+    if (block.type === "image") return { type: "image", imageId: imageIds.get(block.imageId) ?? "" };
+    if (block.type === "file") return { type: "file", fileId: fileIds.get(block.fileId) ?? "" };
+    return block;
+  });
+  return isRichChatMessage({ type: "chat-rich", version: 3, id, blocks, images, files, ...(draft.reply ? { reply: draft.reply } : {}) });
+}
+
 const workspaceShellClassName = "flex h-full min-h-0 w-full max-w-2xl flex-col pb-[clamp(6rem,7vh,7rem)] pt-6 lg:max-w-3xl";
+const workspaceShellFillClassName = "flex h-full min-h-0 w-full flex-col pb-[clamp(6rem,7vh,7rem)] pt-6";
 const workspaceScrollClassName = "min-h-0 flex-1 px-2 pb-7 pt-4 pr-5 [mask-image:linear-gradient(to_bottom,transparent_0%,black_4rem,black_calc(100%-3rem),transparent_100%)]";
 const workspaceComposerClassName = "relative h-28 shrink-0";
 
 function WorkspaceShell({
   banner,
   children,
+  fill = false,
   footer,
   composerAutoSize = false,
   reverse = false,
@@ -160,6 +224,8 @@ function WorkspaceShell({
 }: {
   banner?: ReactNode;
   children: ReactNode;
+  /** Drop the centered max-width column: the split pane owns the width. */
+  fill?: boolean;
   footer: ReactNode;
   composerAutoSize?: boolean;
   reverse?: boolean;
@@ -173,7 +239,7 @@ function WorkspaceShell({
 }) {
   return (
     <section
-      className={workspaceShellClassName}
+      className={fill ? workspaceShellFillClassName : workspaceShellClassName}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
@@ -191,6 +257,38 @@ function WorkspaceShell({
         <div className={composerAutoSize ? "relative min-h-28 shrink-0" : workspaceComposerClassName}>{footer}</div>
       </form>
     </section>
+  );
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => typeof window === "undefined" ? false : window.matchMedia(query).matches);
+  useEffect(() => {
+    const mediaQueryList = window.matchMedia(query);
+    const onChange = () => setMatches(mediaQueryList.matches);
+    onChange();
+    mediaQueryList.addEventListener("change", onChange);
+    return () => mediaQueryList.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
+}
+
+/**
+ * Two-pane layout: chat keeps the left column, the collaboration/canvas pane
+ * fills the right. The ratio is a percentage of the container width owned by
+ * the chat column, dragged via the divider and persisted to localStorage.
+ */
+function SplitWorkspaceLayout({ chat, dividerLabel, partner }: {
+  chat: ReactNode;
+  dividerLabel: string;
+  partner: ReactNode;
+}) {
+  const [ratio, setRatio] = useState(readStoredSplitRatio);
+  return (
+    <div className="flex h-full min-h-0 w-full gap-1" data-split-pane="">
+      <section className="h-full min-h-0 min-w-0" style={{ width: `${ratio}%` }}>{chat}</section>
+      <SplitDivider ariaLabel={dividerLabel} onChange={setRatio} onCommit={storeSplitRatio} ratio={ratio} />
+      <section className="h-full min-h-0 min-w-0 flex-1">{partner}</section>
+    </div>
   );
 }
 
@@ -218,7 +316,6 @@ function displayedNumber(value: number, precision = 0): number {
 const ignoreDialogOpenChange = () => undefined;
 
 type RoomLocale = "en" | "zh";
-type WorkspaceId = "chat" | "files" | "video" | "voice" | "watch" | "collaborate" | "canvas";
 // Whether a peer transport exists: "solo" = seat admitted, nobody else in the
 // room; "away" = had a peer, lost it. Both keep the chat workspace usable.
 type PeerPresence = "solo" | "connecting" | "active" | "away";
@@ -306,7 +403,6 @@ const workspaceCopy = {
       watch: ["Watch together", "Synchronize a shared video or audio session."],
     },
     background: "Running in background",
-    chatPlaceholder: "Write a message",
     chatEmpty: "Send a message to begin your private conversation",
     chatLoadMore: (count: number) => (count === 1 ? "Load 1 earlier message" : `Load ${count} earlier messages`),
     chatSoloWaiting: "The other participant has not joined yet — messages will sync once they join.",
@@ -317,6 +413,7 @@ const workspaceCopy = {
     exitDescription: "This will close your end-to-end connection and stop all room activity.",
     exitTitle: "Leave this room?",
     room: "ROOM",
+    splitDivider: "Resize split panes",
     typing: "Typing...",
   },
   zh: {
@@ -330,7 +427,6 @@ const workspaceCopy = {
       watch: ["同播", "同步观看视频或一起听音频。"],
     },
     background: "正在后台运行",
-    chatPlaceholder: "输入消息",
     chatEmpty: "发送一条消息，开始私密对话",
     chatLoadMore: (count: number) => `加载更早的 ${count} 条消息`,
     chatSoloWaiting: "对方还未加入 · 留言将在其加入后自动同步。",
@@ -341,11 +437,12 @@ const workspaceCopy = {
     exitDescription: "这将关闭端对端连接，并停止房间内的所有活动。",
     exitTitle: "确认退出房间？",
     room: "房间",
+    splitDivider: "调整分栏宽度",
     typing: "正在输入...",
   },
 } as const;
 
-const workspaceOrder: WorkspaceId[] = ["chat", "files", "video", "voice", "watch", "collaborate", "canvas"];
+const dockWorkspaces = ["chat", "collaborate", "canvas"] as const;
 const workspaceIcons = {
   canvas: RiBrushLine,
   chat: RiChat3Line,
@@ -356,13 +453,12 @@ const workspaceIcons = {
   watch: RiPlayCircleLine,
 } as const;
 
-function workspaceFromHash(): WorkspaceId | null {
-  if (window.location.hash === "#status") {
+function workspaceFromHash(): { active: WorkspaceId | null; side: SplitSideWorkspace | null } {
+  if (window.location.hash.split("+")[0] === "#status") {
     window.history.replaceState(null, "", "#chat");
-    return "chat";
+    return { active: "chat", side: null };
   }
-  const workspaceId = window.location.hash.slice(1) as WorkspaceId;
-  return workspaceOrder.includes(workspaceId) ? workspaceId : null;
+  return parseWorkspaceHash(window.location.hash);
 }
 
 const detailTranslation: Record<string, string> = {
@@ -918,6 +1014,9 @@ function ChatWorkspace({
   accent,
   banner,
   emptyMessage,
+  files,
+  fileActions,
+  layout = "single",
   loadMoreLabel,
   messages,
   onMarkRead,
@@ -925,21 +1024,23 @@ function ChatWorkspace({
   locale,
   onTyping,
   peerTyping,
-  placeholder,
   ready,
   typingLabel,
 }: {
   accent: string;
   banner?: ReactNode;
   emptyMessage: string;
+  files: FileTransferSnapshot[];
+  fileActions: FileTransferActions;
+  /** "split" widens the shell to fill a split pane instead of the centered column. */
+  layout?: "single" | "split";
   loadMoreLabel: (count: number) => string;
   messages: ChatMessage[];
-  onMarkRead: (id: string) => boolean;
+  onMarkRead: (id: string, visibleImages: ReadonlySet<string>) => boolean;
   controller: ChatController;
   locale: RoomLocale;
   onTyping: () => void;
   peerTyping: boolean;
-  placeholder: string;
   ready: boolean;
   typingLabel: string;
 }) {
@@ -949,15 +1050,19 @@ function ChatWorkspace({
   const [replyTarget, setReplyTarget] = useState<{ id: string; request: number } | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [replyNotice, setReplyNotice] = useState<string | null>(null);
+  const entries = useMemo(() => [
+    ...messages.map((message) => ({ id: message.id, type: "message" as const, message })),
+    ...files.map((file) => ({ id: file.id, type: "file" as const, file })),
+  ].sort((left, right) => left.id.localeCompare(right.id)), [messages, files]);
 
   const locateReply = (id: string) => {
-    const index = messages.findIndex((message) => message.id === id);
+    const index = entries.findIndex((entry) => entry.type === "message" && entry.id === id);
     if (index < 0) {
       setReplyNotice(locale === "zh" ? "原消息不在当前聊天记录中" : "The original message is not in this chat history.");
       return;
     }
     setReplyNotice(null);
-    setVisibleCount((count) => Math.max(count, messages.length - index));
+    setVisibleCount((count) => Math.max(count, entries.length - index));
     setReplyTarget((current) => ({ id, request: (current?.request ?? 0) + 1 }));
   };
 
@@ -988,33 +1093,45 @@ function ChatWorkspace({
   // natively and never yanks a user who scrolled up — no JS scrolling.
 
   useEffect(() => {
-    const viewport = messageListRef.current?.closest("[data-overlayscrollbars-viewport]");
-    if (!(viewport instanceof HTMLElement)) return;
+    const list = messageListRef.current;
+    if (!list) return;
 
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const messageId = (entry.target as HTMLElement).dataset.chatMessageId;
-        if (!messageId || readMessageIdsRef.current.has(messageId) || !onMarkRead(messageId)) continue;
+        if (!entry.isIntersecting || entry.intersectionRatio < CHAT_IMAGE_MIN_VISIBLE_RATIO) continue;
+        const message = entry.target as HTMLElement;
+        const messageId = message.dataset.chatMessageId;
+        if (!messageId || readMessageIdsRef.current.has(messageId)) continue;
+        const bounds = entry.intersectionRect;
+        const visibleImages = new Set<string>();
+        for (const image of message.querySelectorAll<HTMLElement>("[data-chat-image]")) {
+          const rect = image.getBoundingClientRect();
+          const width = Math.max(0, Math.min(rect.right, bounds.right) - Math.max(rect.left, bounds.left));
+          const height = Math.max(0, Math.min(rect.bottom, bounds.bottom) - Math.max(rect.top, bounds.top));
+          if (image.dataset.chatImage && rect.width > 0 && rect.height > 0
+            && width * height >= rect.width * rect.height * CHAT_IMAGE_MIN_VISIBLE_RATIO) {
+            visibleImages.add(image.dataset.chatImage);
+          }
+        }
+        if (!onMarkRead(messageId, visibleImages)) continue;
         readMessageIdsRef.current.add(messageId);
       }
-    }, { root: viewport, threshold: 0.65 });
+    }, { threshold: [CHAT_IMAGE_MIN_VISIBLE_RATIO, 0.65] });
 
-    viewport.querySelectorAll<HTMLElement>("[data-chat-message-id]").forEach((message) => observer.observe(message));
+    list.querySelectorAll<HTMLElement>("[data-chat-message-id]").forEach((message) => observer.observe(message));
     return () => observer.disconnect();
-  }, [messages, onMarkRead, ready, controller.assetVersion]);
+  }, [entries, visibleCount, onMarkRead, ready, controller.assetVersion]);
 
-  const hiddenCount = Math.max(0, messages.length - visibleCount);
-  // slice() copies before reverse(): messages (sorted ascending) is never
-  // mutated; the newest entry becomes the first DOM child, i.e. the bottom
-  // of the column-reverse list.
-  const visibleMessages = messages.slice(hiddenCount).reverse();
+  const hiddenCount = Math.max(0, entries.length - visibleCount);
+  // The newest entry is the first DOM child, at the bottom of the reversed list.
+  const visibleEntries = entries.slice(hiddenCount).reverse();
 
   return (
     <WorkspaceShell
       banner={<>{banner}{replyNotice ? <p className="mb-2 text-xs opacity-70" role="status">{replyNotice}</p> : null}{controller.error ? <p className="mb-2 text-xs text-rose-300" role="alert">{controller.error}</p> : null}</>}
       composerAutoSize
-      footer={<ChatComposer accent={accent} locale={locale} onSend={controller.onSend} onStateChange={controller.onStateChange} onTyping={onTyping} ready={ready} state={controller.state} />}
+      fill={layout === "split"}
+      footer={<ChatComposer accent={accent} imageBudget={controller.imageStore.budget} locale={locale} onSend={controller.onSend} onStateChange={controller.onStateChange} onTyping={onTyping} ready={ready} state={controller.state} />}
       status={(
         <AutoTransition
           as="span"
@@ -1028,14 +1145,23 @@ function ChatWorkspace({
         </AutoTransition>
       )}
       reverse
-      scrollKey={`${messages.length}:${visibleCount}`}
+      scrollKey={`${entries.length}:${visibleCount}`}
     >
-        <div ref={messageListRef} className={`flex min-h-full w-full shrink-0 flex-col-reverse justify-end ${messages.length === 0 ? "" : "pt-8"}`}>
+        <div ref={messageListRef} className={`flex min-h-full w-full shrink-0 flex-col-reverse justify-end ${entries.length === 0 ? "" : "pt-8"}`}>
           <AnimatePresence initial={false} mode="popLayout">
-            {messages.length === 0 ? (
+            {entries.length === 0 ? (
               <WorkspaceEmptyState icon={<RiChat3Line aria-hidden="true" className="size-10 text-sky-200/55" />} key="empty-chat" message={emptyMessage} />
-            ) : visibleMessages.map((message) => {
+            ) : visibleEntries.map((entry) => {
+                if (entry.type === "file") {
+                  return (
+                    <motion.div className="flex flex-col" key={`file:${entry.id}`} layout="position">
+                      <FileTransferCard accent={accent} actions={fileActions} chat file={entry.file} locale={locale} />
+                    </motion.div>
+                  );
+                }
+                const { message } = entry;
                 const isLocal = message.sender === "local";
+                const hasFiles = message.blocks?.some((block) => block.type === "file");
                 return (
                   <motion.div key={message.id} layout="position" transition={{ duration: 0.2, ease: "easeOut" }}>
                     <motion.div
@@ -1057,7 +1183,16 @@ function ChatWorkspace({
                             : { backgroundColor: "var(--zest-bubble-remote-bg)", color: "var(--zest-bubble-remote-fg)" }}
                         >
                           {message.reply ? <div className="mb-2"><ChatReplyCard reply={message.reply} replySender={message.sender} locale={locale} onClick={() => locateReply(message.reply!.messageId)} /></div> : null}
-                          {message.blocks ? <ChatImageMessage blocks={message.blocks} images={message.images} localImages={message.localImages} locale={locale} store={controller.imageStore} /> : message.text}
+                          {message.blocks ? (
+                            <ChatImageMessage
+                              blocks={message.blocks}
+                              images={message.images}
+                              localImages={message.localImages}
+                              locale={locale}
+                              renderFile={(id) => <ChatFileMessage file={message.files?.find((file) => file.fileId === id)} local={message.localFiles?.find((file) => file.id === id)} locale={locale} />}
+                              store={controller.imageStore}
+                            />
+                          ) : message.text}
                         </div>
                         <svg
                           aria-hidden="true"
@@ -1069,9 +1204,15 @@ function ChatWorkspace({
                           <path d="M 0 0 L 8 12 L 0 12 Z" fill={isLocal ? `${accent}40` : "rgb(0 0 0 / 0.25)"} />
                         </svg>
                       </div>
-                      {isLocal && (message.uploadState === "waiting" || message.uploadState === "uploading") ? <span className="mt-1 text-xs opacity-60" role="status">{message.uploadState === "waiting" ? (locale === "zh" ? "等待连接后上传图片" : "Images queued until the room reconnects") : (locale === "zh" ? `上传图片 ${message.uploadCount ?? 0}/${message.localImages?.length ?? 0}` : `Uploading images ${message.uploadCount ?? 0}/${message.localImages?.length ?? 0}`)}</span> : null}
+                      {isLocal && (message.uploadState === "waiting" || message.uploadState === "uploading") ? (
+                        <span className="mt-1 text-xs opacity-60" role="status">
+                          {message.uploadState === "waiting"
+                            ? (locale === "zh" ? `等待房间连接后上传${hasFiles ? "附件" : "图片"}` : `${hasFiles ? "Attachments" : "Images"} queued until the room reconnects`)
+                            : `${locale === "zh" ? `上传${hasFiles ? "附件" : "图片"}` : `Uploading ${hasFiles ? "attachments" : "images"}`} ${message.uploadCount ?? 0}/${message.uploadTotal ?? 0}`}
+                        </span>
+                      ) : null}
                       {isLocal && message.imageError ? <span className="mt-1 max-w-[82%] text-xs text-rose-300" role="alert">{message.imageError}</span> : null}
-                      {isLocal && (message.deliveryStatus === "error" || message.uploadState === "error") ? <button aria-label={locale === "zh" ? "重试发送消息" : "Retry message"} className="mt-1 inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs hover:bg-white/10" onClick={() => controller.onRetry(message.id)} type="button"><RiRefreshLine aria-hidden="true" className="size-3" />{locale === "zh" ? "重试" : "Retry"}</button> : null}
+                      {isLocal && message.deliveryStatus === "error" && message.uploadState !== "expired" && message.uploadState !== "invalid" ? <button aria-label={locale === "zh" ? "重试发送消息" : "Retry message"} className="mt-1 inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs hover:bg-white/10" onClick={() => controller.onRetry(message.id)} type="button"><RiRefreshLine aria-hidden="true" className="size-3" />{locale === "zh" ? "重试" : "Retry"}</button> : null}
                       <p className={`mt-1.5 flex h-4 items-center gap-1.5 px-1 text-xs font-medium leading-none tabular-nums text-sky-100/40 ${isLocal ? "justify-end" : "justify-start"}`}>
                         <time dateTime={new Date(message.sentAt).toISOString()}>
                           {new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(message.sentAt)}
@@ -2290,55 +2431,44 @@ type TransferDiagnostics = {
   transport: WebRTCTransportDiagnostics;
 };
 
-function FileWorkspace({ accent, files, locale, onAccept, onCancel, onDelete, onDiagnostics, onDownload, onOffer, onPause, onResend, ready }: {
-  accent: string;
-  files: FileTransferSnapshot[];
-  locale: RoomLocale;
+type FileTransferActions = {
   onAccept: (id: string) => void;
   onCancel: (id: string) => void;
   onDelete: (id: string) => void;
   onDiagnostics: (id: string) => Promise<TransferDiagnostics | null>;
   onDownload: (id: string) => void;
   onPause: (id: string) => void;
-  onOffer: (files: FileList | File[]) => void;
   onResend: (id: string) => void;
-  ready: boolean;
-}) {
-  const [isDragging, setIsDragging] = useState(false);
-  const dragDepthRef = useRef(0);
-  const [previewFile, setPreviewFile] = useState<FileTransferSnapshot | null>(null);
-  const [diagnosticFile, setDiagnosticFile] = useState<FileTransferSnapshot | null>(null);
-  const [diagnostics, setDiagnostics] = useState<TransferDiagnostics | null>(null);
-  const pickerRef = useRef<HTMLInputElement>(null);
-  const diagnosticClicksRef = useRef(new Map<string, { count: number; timer: number }>());
-  const copy = locale === "zh"
+};
+
+function fileTransferCopy(locale: RoomLocale) {
+  return locale === "zh"
     ? { accept: "接收", reject: "拒绝", cancel: "取消", choose: "拖入、粘贴或选择文件", empty: "选择文件以发送", offered: "对方向你发送了一个文件", sending: "正在发送", waiting: "等待对方确认", receiving: "正在接收", paused: "已暂停", complete: "传输完成", cancelled: "已取消", error: "传输失败", preview: "预览", view: "查看", pause: "暂停", resume: "继续", stop: "停止", save: "保存", remove: "删除", resend: "再次发送", previewUnsupported: "不支持预览此文件类型" }
     : { accept: "Receive", reject: "Reject", cancel: "Cancel", choose: "Drop, paste, or choose files", empty: "Choose files to send", offered: "The other participant wants to send you a file", sending: "Sending", waiting: "Waiting for acceptance", receiving: "Receiving", paused: "Paused", complete: "Transfer complete", cancelled: "Cancelled", error: "Transfer failed", preview: "Preview", view: "View", pause: "Pause", resume: "Resume", stop: "Stop", save: "Save", remove: "Delete", resend: "Send again", previewUnsupported: "This file type cannot be previewed" };
+}
 
-  const stateLabel = (file: FileTransferSnapshot) => file.state === "offered"
-    ? file.direction === "incoming" ? copy.offered : copy.waiting
-    : file.state === "waiting" ? copy.waiting
-    : file.state === "transferring" ? file.paused ? copy.paused : file.direction === "incoming" ? copy.receiving : copy.sending
-    : file.state === "complete" ? copy.complete
-    : file.state === "cancelled" ? copy.cancelled
-    : file.error || copy.error;
+function FileTransferCard({ accent, actions, chat = false, file, locale }: {
+  accent: string;
+  actions: FileTransferActions;
+  chat?: boolean;
+  file: FileTransferSnapshot;
+  locale: RoomLocale;
+}) {
+  const { onAccept, onCancel, onDelete, onDiagnostics, onDownload, onPause, onResend } = actions;
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<TransferDiagnostics | null>(null);
+  const diagnosticClicks = useRef({ count: 0, lastAt: 0 });
+  const copy = fileTransferCopy(locale);
+  const isIncoming = file.direction === "incoming";
+  const active = file.state === "transferring";
+  const complete = file.state === "complete";
 
   useEffect(() => {
-      const onPaste = (event: ClipboardEvent) => {
-        const files = Array.from(event.clipboardData?.files ?? []);
-        if (!files.length || !ready) return;
-        event.preventDefault();
-        onOffer(files);
-      };
-      window.addEventListener("paste", onPaste);
-      return () => window.removeEventListener("paste", onPaste);
-    }, [onOffer, ready]);
-
-  useEffect(() => {
-    if (!diagnosticFile) return;
+    if (!diagnosticsOpen) return;
     let cancelled = false;
     const refresh = async () => {
-      const snapshot = await onDiagnostics(diagnosticFile.id);
+      const snapshot = await onDiagnostics(file.id);
       if (!cancelled) setDiagnostics(snapshot);
     };
     void refresh();
@@ -2347,25 +2477,182 @@ function FileWorkspace({ accent, files, locale, onAccept, onCancel, onDelete, on
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [diagnosticFile, onDiagnostics]);
+  }, [diagnosticsOpen, file.id, onDiagnostics]);
 
-  useEffect(() => () => {
-    diagnosticClicksRef.current.forEach(({ timer }) => window.clearTimeout(timer));
-    diagnosticClicksRef.current.clear();
-  }, []);
-
-  const openDiagnostics = (file: FileTransferSnapshot) => {
-    const current = diagnosticClicksRef.current.get(file.id);
-    if (current) window.clearTimeout(current.timer);
-    const count = (current?.count ?? 0) + 1;
-    const timer = window.setTimeout(() => diagnosticClicksRef.current.delete(file.id), 500);
-    diagnosticClicksRef.current.set(file.id, { count, timer });
+  const openDiagnostics = () => {
+    const now = Date.now();
+    const count = now - diagnosticClicks.current.lastAt <= 500 ? diagnosticClicks.current.count + 1 : 1;
+    diagnosticClicks.current = { count: count === 3 ? 0 : count, lastAt: now };
     if (count !== 3) return;
-    window.clearTimeout(timer);
-    diagnosticClicksRef.current.delete(file.id);
     setDiagnostics(null);
-    setDiagnosticFile(file);
+    setDiagnosticsOpen(true);
   };
+
+  const status = file.state === "offered"
+    ? isIncoming ? copy.offered : copy.waiting
+    : file.state === "waiting" ? copy.waiting
+    : active ? file.paused ? copy.paused : isIncoming ? copy.receiving : copy.sending
+    : complete ? copy.complete
+    : file.state === "cancelled" ? copy.cancelled : file.error || copy.error;
+  const progress = file.size ? Math.min(100, file.transferredBytes / file.size * 100) : complete ? 100 : 0;
+  const confirmed = file.size ? Math.min(100, file.confirmedBytes / file.size * 100) : complete ? 100 : 0;
+  const Icon = fileIcon(file.name);
+  const eta = complete && file.duration !== null ? Math.max(0, Math.round(file.duration / 1000)) : file.eta;
+  const displaySpeed = complete ? file.averageSpeed : file.speed;
+  const preview = () => setPreviewOpen(true);
+  const action = (label: string, ActionIcon: typeof RiEyeLine, onClick: () => void, backgroundColor?: string, disabled = false) => (
+    <Clickable key={label} className="h-full w-full min-w-0" disabled={disabled} enableHoverScale hoverScale={1.035} interactive={false} tapScale={0.97}>
+      <button
+        className="inline-flex h-full w-full min-w-0 items-center justify-center gap-1.5 rounded-xl border border-white/10 px-2 py-2 text-xs font-semibold tracking-[0.02em] transition-colors disabled:cursor-not-allowed disabled:opacity-35"
+        disabled={disabled}
+        onClick={onClick}
+        style={{ backgroundColor }}
+        type="button"
+      >
+        <ActionIcon aria-hidden="true" className="size-4 shrink-0" />
+        <span className="truncate">{label}</span>
+      </button>
+    </Clickable>
+  );
+  const viewTint = `${accent}40`;
+  const acceptTint = "var(--zest-accept-tint)";
+  const rejectTint = "var(--zest-reject-tint)";
+  const pauseAction = action(file.paused || !active ? copy.resume : copy.pause, file.paused || !active ? RiPlayLine : RiPauseLine, () => onPause(file.id), acceptTint, !active);
+  let buttons: ReactNode[];
+  if (isIncoming && file.state === "offered") {
+    buttons = [
+      action(copy.preview, RiEyeLine, preview, viewTint),
+      action(copy.accept, RiDownload2Line, () => onAccept(file.id), acceptTint),
+      action(copy.reject, RiDeleteBinLine, () => onCancel(file.id), rejectTint),
+    ];
+  } else if (isIncoming && active) {
+    buttons = [
+      action(copy.preview, RiEyeLine, preview, undefined, true),
+      pauseAction,
+      action(copy.stop, RiStopLine, () => onCancel(file.id), rejectTint),
+    ];
+  } else if (complete) {
+    buttons = [
+      action(copy.view, RiEyeLine, preview, viewTint),
+      isIncoming ? action(copy.save, RiDownload2Line, () => onDownload(file.id), acceptTint)
+        : action(copy.resend, RiRefreshLine, () => onResend(file.id), acceptTint),
+      action(isIncoming ? copy.remove : copy.cancel, RiDeleteBinLine, () => onDelete(file.id), rejectTint),
+    ];
+  } else {
+    buttons = [action(copy.view, RiEyeLine, preview), pauseAction, action(copy.cancel, RiCloseCircleFill, () => onCancel(file.id), rejectTint)];
+  }
+
+  return (
+    <motion.article
+      animate={{ opacity: 1, y: 0 }}
+      className={chat
+        ? `mb-5 w-full max-w-md overflow-hidden rounded-2xl border border-white/10 bg-black/25 p-3 ${isIncoming ? "self-start" : "self-end"}`
+        : "overflow-hidden border-b border-white/10 pb-4"}
+      data-chat-file-id={chat ? file.id : undefined}
+      exit={{ height: 0, opacity: 0, y: -10, paddingBottom: 0 }}
+      initial={{ opacity: 0, y: 10 }}
+      layout="position"
+      transition={{ layout: { duration: 0.3, ease: "easeOut" }, opacity: { duration: 0.18 }, height: { duration: 0.26, ease: "easeInOut" } }}
+    >
+      <div className="flex min-w-0 items-stretch gap-3">
+        <button aria-label={file.name} className={`grid aspect-square shrink-0 place-items-center text-sky-200/65 ${chat ? "w-8 sm:w-12" : "w-16"}`} onClick={openDiagnostics} type="button">
+          <Icon aria-hidden="true" className={chat ? "size-7 sm:size-9" : "size-11"} />
+        </button>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-bold tracking-[0.04em] text-sky-50" title={file.name}>{file.name}</p>
+          <div aria-hidden="true" className="mt-3 space-y-1.5">
+            <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+              <motion.div animate={{ width: `${progress}%` }} className="h-full rounded-full" initial={{ width: "0%" }} style={{ backgroundColor: accent }} transition={{ type: "spring", stiffness: 220, damping: 28 }} />
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
+              <motion.div animate={{ width: `${confirmed}%` }} className="h-full rounded-full bg-sky-100/45" initial={{ width: "0%" }} transition={{ type: "spring", stiffness: 220, damping: 28 }} />
+            </div>
+          </div>
+          <NumberFlowGroup>
+            <motion.div layout="position" className="mt-2 flex flex-wrap items-baseline gap-x-2 text-xs font-medium text-sky-100/45">
+              <span className="inline-flex items-baseline font-mono tabular-nums"><NumberFlow value={Math.round(progress)} willChange />%</span>
+              <span className="inline-flex items-baseline gap-x-1"><FileSizeValue bytes={file.transferredBytes} />/<FileSizeValue bytes={file.size} /></span>
+              <span>{displaySpeed > 0 ? <FileSizeValue bytes={displaySpeed} suffix="/s" /> : "-- /s"}</span>
+              <EtaValue seconds={eta} />
+              <span className="break-words">{status}</span>
+            </motion.div>
+          </NumberFlowGroup>
+          <div className={chat ? "mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(6rem,100%),1fr))] gap-2" : "mt-3 grid grid-cols-3 gap-2"}>
+            {buttons}
+          </div>
+        </div>
+      </div>
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent aria-labelledby="file-preview-title" className="!max-w-md">
+          <div className="p-6 sm:p-8">
+            <p className="text-xs font-bold tracking-[0.12em] text-sky-100/50">{locale === "zh" ? "文件预览" : "FILE PREVIEW"}</p>
+            <h2 className="mt-3 truncate text-xl font-bold tracking-[0.04em] text-sky-50 sm:text-2xl" id="file-preview-title">{file.name}</h2>
+            <p className="mt-5 text-sm font-medium tracking-[0.04em] text-sky-100/60">{copy.previewUnsupported}</p>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen}>
+        <DialogContent aria-labelledby="file-diagnostics-title" className="!max-w-2xl">
+          <div className="flex min-w-0 flex-col">
+            <div className="flex items-start justify-between gap-5 border-b border-white/10 p-5 sm:p-6">
+              <div className="min-w-0">
+                <p className="text-[0.65rem] font-bold tracking-[0.14em] text-sky-100/45">{locale === "zh" ? "传输诊断" : "TRANSFER DIAGNOSTICS"}</p>
+                <h2 className="mt-2 truncate text-lg font-bold tracking-[0.04em] text-sky-50 sm:text-xl" id="file-diagnostics-title">{file.name}</h2>
+              </div>
+              <DialogClose aria-label={locale === "zh" ? "关闭传输诊断" : "Close transfer diagnostics"} data-dialog-autofocus />
+            </div>
+            {diagnostics ? <div className="grid grid-cols-2 gap-x-6 px-5 py-4 sm:grid-cols-3 sm:px-6">
+              <DiagnosticItem label={locale === "zh" ? "连接路径" : "Route"} value={diagnostics.file.connectionRoute === "relay" ? "TURN relay" : "Direct"} />
+              <DiagnosticItem label={locale === "zh" ? "ICE RTT" : "ICE RTT"} value={diagnostics.transport.currentRoundTripTime === null ? "--" : `${Math.round(diagnostics.transport.currentRoundTripTime)} ms`} />
+              <DiagnosticItem label={locale === "zh" ? "TURN 传输协议" : "TURN transport"} value={diagnostics.transport.relayProtocol?.toUpperCase() ?? "--"} />
+              <DiagnosticItem label={locale === "zh" ? "本地 / 远端协议" : "Local / remote protocol"} value={`${diagnostics.transport.localProtocol?.toUpperCase() ?? "--"} / ${diagnostics.transport.remoteProtocol?.toUpperCase() ?? "--"}`} />
+              <DiagnosticItem label={locale === "zh" ? "分块 / 分段" : "Block / segment"} value={`${formatByteCount(diagnostics.file.blockSize)} / ${formatByteCount(diagnostics.file.segmentSize)}`} />
+              <DiagnosticItem label={locale === "zh" ? "飞行窗口" : "In-flight window"} value={`${diagnostics.file.inFlightBlocks} / ${diagnostics.file.maxInFlightBlocks} blocks`} />
+              <DiagnosticItem label={locale === "zh" ? "已确认区块" : "Confirmed blocks"} value={`${diagnostics.file.completedBlocks} / ${diagnostics.file.blockCount}`} />
+              <DiagnosticItem label={locale === "zh" ? "远端 Credit" : "Remote credit"} value={formatByteCount(diagnostics.file.remoteCredit)} />
+              <DiagnosticItem label={locale === "zh" ? "Bulk 缓冲" : "Bulk buffer"} value={diagnostics.transport.bufferedAmount.bulk === null ? "--" : formatByteCount(diagnostics.transport.bufferedAmount.bulk)} />
+              <DiagnosticItem label={locale === "zh" ? "未确认字节" : "Unconfirmed bytes"} value={formatByteCount(diagnostics.file.inFlightBytes)} />
+              <DiagnosticItem label={locale === "zh" ? "接收重组队列" : "Receive assembly"} value={`${diagnostics.file.pendingReceiveBlocks} blocks`} />
+              <DiagnosticItem label={locale === "zh" ? "完整性重试" : "Integrity retries"} value={String(diagnostics.file.retries)} />
+              <DiagnosticItem label={locale === "zh" ? "候选对" : "Candidate pair"} value={`${diagnostics.transport.localCandidateType ?? "--"} -> ${diagnostics.transport.remoteCandidateType ?? "--"}`} />
+              <DiagnosticItem label={locale === "zh" ? "可用上行带宽" : "Available uplink"} value={diagnostics.transport.availableOutgoingBitrate === null ? "--" : `${formatByteCount(diagnostics.transport.availableOutgoingBitrate / 8)}/s`} />
+              <DiagnosticItem label={locale === "zh" ? "候选对发送 / 接收" : "Pair sent / received"} value={diagnostics.transport.bytesSent === null || diagnostics.transport.bytesReceived === null ? "--" : `${formatByteCount(diagnostics.transport.bytesSent)} / ${formatByteCount(diagnostics.transport.bytesReceived)}`} />
+              <DiagnosticItem label={locale === "zh" ? "发送侧丢弃" : "Discarded on send"} value={diagnostics.transport.packetsDiscardedOnSend === null ? "--" : String(diagnostics.transport.packetsDiscardedOnSend)} />
+              <DiagnosticItem label={locale === "zh" ? "SCTP 状态" : "SCTP state"} value={diagnostics.transport.sctpState ?? "--"} />
+              <DiagnosticItem label={locale === "zh" ? "SCTP 平滑 RTT" : "SCTP smoothed RTT"} value={diagnostics.transport.sctpSmoothedRoundTripTime === null ? "--" : `${Math.round(diagnostics.transport.sctpSmoothedRoundTripTime)} ms`} />
+              <DiagnosticItem label={locale === "zh" ? "SCTP 拥塞窗口" : "SCTP congestion window"} value={diagnostics.transport.sctpCongestionWindow === null ? "--" : formatByteCount(diagnostics.transport.sctpCongestionWindow)} />
+              <DiagnosticItem label={locale === "zh" ? "SCTP 接收窗口" : "SCTP receiver window"} value={diagnostics.transport.sctpReceiverWindow === null ? "--" : formatByteCount(diagnostics.transport.sctpReceiverWindow)} />
+            </div> : <p className="px-5 py-6 text-sm font-medium tracking-[0.04em] text-sky-100/55 sm:px-6">{locale === "zh" ? "正在读取本地传输状态..." : "Reading local transfer state..."}</p>}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </motion.article>
+  );
+}
+
+function FileWorkspace({ accent, actions, files, locale, onOffer, ready }: {
+  accent: string;
+  actions: FileTransferActions;
+  files: FileTransferSnapshot[];
+  locale: RoomLocale;
+  onOffer: (files: FileList | File[]) => void;
+  ready: boolean;
+}) {
+  const [isDragging, setIsDragging] = useState(false);
+  const dragDepthRef = useRef(0);
+  const pickerRef = useRef<HTMLInputElement>(null);
+  const copy = fileTransferCopy(locale);
+
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      const selected = Array.from(event.clipboardData?.files ?? []);
+      if (!selected.length || !ready) return;
+      event.preventDefault();
+      onOffer(selected);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [onOffer, ready]);
 
   return (
     <WorkspaceShell
@@ -2403,69 +2690,15 @@ function FileWorkspace({ accent, files, locale, onAccept, onCancel, onDelete, on
       scrollKey={files.map((file) => `${file.id}-${file.state}-${file.transferredBytes}`).join("|")}
     >
       <input className="sr-only" multiple onChange={(event) => { if (event.target.files?.length) onOffer(event.target.files); event.target.value = ""; }} ref={pickerRef} type="file" />
-      {files.length === 0 ? <WorkspaceEmptyState icon={<RiFolderTransferLine aria-hidden="true" className="size-10 text-sky-200/55" />} message={copy.empty} /> : <div className="space-y-3 pt-4"><AnimatePresence initial={false}>{files.map((file) => {
-        const progress = file.size ? Math.min(100, file.transferredBytes / file.size * 100) : file.state === "complete" ? 100 : 0;
-        const confirmed = file.size ? Math.min(100, file.confirmedBytes / file.size * 100) : file.state === "complete" ? 100 : 0;
-        const Icon = fileIcon(file.name);
-        const eta = file.state === "complete" && file.duration !== null ? Math.max(0, Math.round(file.duration / 1000)) : file.eta;
-        const displaySpeed = file.state === "complete" ? file.averageSpeed : file.speed;
-        const isIncoming = file.direction === "incoming";
-        const active = file.state === "transferring";
-        const actionClass = "inline-flex min-w-0 items-center justify-center gap-1.5 rounded-xl border border-white/10 px-2 py-2 text-xs font-semibold tracking-[0.02em] transition-colors disabled:cursor-not-allowed disabled:opacity-35";
-        const preview = () => setPreviewFile(file);
-        const action = (label: string, IconComponent: typeof RiEyeLine, onClick: () => void, style?: CSSProperties, disabled = false, transitionKey = label) => <Clickable className="h-full w-full min-w-0" disabled={disabled} enableHoverScale hoverScale={1.035} interactive={false} tapScale={0.97}><button className={`${actionClass} h-full w-full`} disabled={disabled} onClick={onClick} style={style} type="button"><AutoTransition as="span" className="inline-flex min-w-0 items-center justify-center gap-1.5" duration={0.18} presenceMode="wait" transitionKey={transitionKey} type="fade"><IconComponent aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{label}</span></AutoTransition></button></Clickable>;
-        let actions: ReactNode[];
-        if (isIncoming && file.state === "offered") actions = [action(copy.preview, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.accept, RiDownload2Line, () => onAccept(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.reject, RiDeleteBinLine, () => onCancel(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
-        else if (isIncoming && active) actions = [action(copy.preview, RiEyeLine, preview, undefined, true), action(file.paused ? copy.resume : copy.pause, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "var(--zest-accept-tint)" }), action(copy.stop, RiStopLine, () => onCancel(file.id), { backgroundColor: "var(--zest-reject-tint)" })];
-        else if (isIncoming && file.state === "complete") actions = [action(copy.view, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.save, RiDownload2Line, () => onDownload(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.remove, RiDeleteBinLine, () => onDelete(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
-        else if (!isIncoming && file.state === "complete") actions = [action(copy.view, RiEyeLine, preview, { backgroundColor: `${accent}40` }), action(copy.resend, RiRefreshLine, () => onResend(file.id), { backgroundColor: "rgba(16, 185, 129, 0.28)" }), action(copy.cancel, RiDeleteBinLine, () => onDelete(file.id), { backgroundColor: "rgba(244, 63, 94, 0.28)" })];
-        else actions = [action(copy.view, RiEyeLine, preview), action(active && !file.paused ? copy.pause : copy.resume, file.paused ? RiPlayLine : RiPauseLine, () => onPause(file.id), { backgroundColor: "var(--zest-accept-tint)" }, !active), action(copy.cancel, RiCloseCircleFill, () => onCancel(file.id), { backgroundColor: "var(--zest-reject-tint)" })];
-        return <motion.article animate={{ opacity: 1, y: 0 }} className="overflow-hidden border-b border-white/10 pb-4" exit={{ height: 0, opacity: 0, y: -10, paddingBottom: 0 }} initial={{ opacity: 0, y: 10 }} key={file.id} layout transition={{ layout: { duration: 0.3, ease: "easeOut" }, opacity: { duration: 0.18 }, height: { duration: 0.26, ease: "easeInOut" }, y: { duration: 0.22, ease: "easeOut" } }}><div className="flex min-w-0 items-stretch gap-3"><button aria-label={file.name} className="grid aspect-square w-16 shrink-0 place-items-center text-sky-200/65" onClick={() => openDiagnostics(file)} type="button"><Icon aria-hidden="true" className="size-11" /></button><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold tracking-[0.04em] text-sky-50">{file.name}</p><div className="mt-3 space-y-1.5"><div className="h-1.5 overflow-hidden rounded-full bg-white/10"><motion.div animate={{ width: `${progress}%` }} className="h-full rounded-full" initial={{ width: "0%" }} style={{ backgroundColor: accent }} transition={{ type: "spring", stiffness: 220, damping: 28 }} /></div><div className="h-1.5 overflow-hidden rounded-full bg-white/[0.07]"><motion.div animate={{ width: `${confirmed}%` }} className="h-full rounded-full bg-sky-100/45" initial={{ width: "0%" }} transition={{ type: "spring", stiffness: 220, damping: 28 }} /></div></div><NumberFlowGroup><motion.div layout="position" className="mt-2 flex flex-wrap items-baseline gap-y-1 text-xs font-medium text-sky-100/45" transition={{ layout: { duration: 0.32, ease: "easeOut" } }}><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><NumberFlow value={Math.round(progress)} willChange /><motion.span layout="position">%</motion.span></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><FileSizeValue bytes={file.transferredBytes} /><motion.span layout="position" className="mx-1">/</motion.span><FileSizeValue bytes={file.size} /></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums">{displaySpeed > 0 ? <FileSizeValue bytes={displaySpeed} suffix="/s" /> : <motion.span layout="position">-- /s</motion.span>}</motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex items-baseline font-mono tabular-nums"><EtaValue seconds={eta} /></motion.span><motion.span layout="position" className="mx-2 font-mono">·</motion.span><motion.span layout="position" className="inline-flex"><AutoTransition as="span" className="inline-flex tracking-[0.03em]" duration={0.18} presenceMode="wait" transitionKey={`${file.state}-${file.paused}-${file.error ?? ""}`} type="fade">{stateLabel(file)}</AutoTransition></motion.span></motion.div></NumberFlowGroup><div className="mt-3 grid grid-cols-3 gap-2">{actions}</div></div></div></motion.article>;
-      })}</AnimatePresence></div>}
-      <Dialog open={previewFile !== null} onOpenChange={(open) => { if (!open) setPreviewFile(null); }}>
-        <DialogContent aria-labelledby="file-preview-title" className="!max-w-md">
-          <div className="p-6 sm:p-8">
-            <p className="text-xs font-bold tracking-[0.12em] text-sky-100/50">{locale === "zh" ? "文件预览" : "FILE PREVIEW"}</p>
-            <h2 className="mt-3 truncate text-xl font-bold tracking-[0.04em] text-sky-50 sm:text-2xl" id="file-preview-title">{previewFile?.name}</h2>
-            <p className="mt-5 text-sm font-medium tracking-[0.04em] text-sky-100/60">{copy.previewUnsupported}</p>
-          </div>
-        </DialogContent>
-      </Dialog>
-      <Dialog open={diagnosticFile !== null} onOpenChange={(open) => { if (!open) { setDiagnosticFile(null); setDiagnostics(null); } }}>
-        <DialogContent aria-labelledby="file-diagnostics-title" className="!max-w-2xl">
-          <div className="flex min-w-0 flex-col">
-            <div className="flex items-start justify-between gap-5 border-b border-white/10 p-5 sm:p-6">
-              <div className="min-w-0">
-                <p className="text-[0.65rem] font-bold tracking-[0.14em] text-sky-100/45">{locale === "zh" ? "传输诊断" : "TRANSFER DIAGNOSTICS"}</p>
-                <h2 className="mt-2 truncate text-lg font-bold tracking-[0.04em] text-sky-50 sm:text-xl" id="file-diagnostics-title">{diagnosticFile?.name}</h2>
-              </div>
-              <DialogClose aria-label={locale === "zh" ? "关闭传输诊断" : "Close transfer diagnostics"} data-dialog-autofocus />
-            </div>
-            {diagnostics ? <div className="grid grid-cols-2 gap-x-6 px-5 py-4 sm:grid-cols-3 sm:px-6">
-              <DiagnosticItem label={locale === "zh" ? "连接路径" : "Route"} value={diagnostics.file.connectionRoute === "relay" ? "TURN relay" : "Direct"} />
-              <DiagnosticItem label={locale === "zh" ? "ICE RTT" : "ICE RTT"} value={diagnostics.transport.currentRoundTripTime === null ? "--" : `${Math.round(diagnostics.transport.currentRoundTripTime)} ms`} />
-              <DiagnosticItem label={locale === "zh" ? "TURN 传输协议" : "TURN transport"} value={diagnostics.transport.relayProtocol?.toUpperCase() ?? "--"} />
-              <DiagnosticItem label={locale === "zh" ? "本地 / 远端协议" : "Local / remote protocol"} value={`${diagnostics.transport.localProtocol?.toUpperCase() ?? "--"} / ${diagnostics.transport.remoteProtocol?.toUpperCase() ?? "--"}`} />
-              <DiagnosticItem label={locale === "zh" ? "分块 / 分段" : "Block / segment"} value={`${formatByteCount(diagnostics.file.blockSize)} / ${formatByteCount(diagnostics.file.segmentSize)}`} />
-              <DiagnosticItem label={locale === "zh" ? "飞行窗口" : "In-flight window"} value={`${diagnostics.file.inFlightBlocks} / ${diagnostics.file.maxInFlightBlocks} blocks`} />
-              <DiagnosticItem label={locale === "zh" ? "已确认区块" : "Confirmed blocks"} value={`${diagnostics.file.completedBlocks} / ${diagnostics.file.blockCount}`} />
-              <DiagnosticItem label={locale === "zh" ? "远端 Credit" : "Remote credit"} value={formatByteCount(diagnostics.file.remoteCredit)} />
-              <DiagnosticItem label={locale === "zh" ? "Bulk 缓冲" : "Bulk buffer"} value={diagnostics.transport.bufferedAmount.bulk === null ? "--" : formatByteCount(diagnostics.transport.bufferedAmount.bulk)} />
-              <DiagnosticItem label={locale === "zh" ? "未确认字节" : "Unconfirmed bytes"} value={formatByteCount(diagnostics.file.inFlightBytes)} />
-              <DiagnosticItem label={locale === "zh" ? "接收重组队列" : "Receive assembly"} value={`${diagnostics.file.pendingReceiveBlocks} blocks`} />
-              <DiagnosticItem label={locale === "zh" ? "完整性重试" : "Integrity retries"} value={String(diagnostics.file.retries)} />
-              <DiagnosticItem label={locale === "zh" ? "候选对" : "Candidate pair"} value={`${diagnostics.transport.localCandidateType ?? "--"} -> ${diagnostics.transport.remoteCandidateType ?? "--"}`} />
-              <DiagnosticItem label={locale === "zh" ? "可用上行带宽" : "Available uplink"} value={diagnostics.transport.availableOutgoingBitrate === null ? "--" : `${formatByteCount(diagnostics.transport.availableOutgoingBitrate / 8)}/s`} />
-              <DiagnosticItem label={locale === "zh" ? "候选对发送 / 接收" : "Pair sent / received"} value={diagnostics.transport.bytesSent === null || diagnostics.transport.bytesReceived === null ? "--" : `${formatByteCount(diagnostics.transport.bytesSent)} / ${formatByteCount(diagnostics.transport.bytesReceived)}`} />
-              <DiagnosticItem label={locale === "zh" ? "发送侧丢弃" : "Discarded on send"} value={diagnostics.transport.packetsDiscardedOnSend === null ? "--" : String(diagnostics.transport.packetsDiscardedOnSend)} />
-              <DiagnosticItem label={locale === "zh" ? "SCTP 状态" : "SCTP state"} value={diagnostics.transport.sctpState ?? "--"} />
-              <DiagnosticItem label={locale === "zh" ? "SCTP 平滑 RTT" : "SCTP smoothed RTT"} value={diagnostics.transport.sctpSmoothedRoundTripTime === null ? "--" : `${Math.round(diagnostics.transport.sctpSmoothedRoundTripTime)} ms`} />
-              <DiagnosticItem label={locale === "zh" ? "SCTP 拥塞窗口" : "SCTP congestion window"} value={diagnostics.transport.sctpCongestionWindow === null ? "--" : formatByteCount(diagnostics.transport.sctpCongestionWindow)} />
-              <DiagnosticItem label={locale === "zh" ? "SCTP 接收窗口" : "SCTP receiver window"} value={diagnostics.transport.sctpReceiverWindow === null ? "--" : formatByteCount(diagnostics.transport.sctpReceiverWindow)} />
-            </div> : <p className="px-5 py-6 text-sm font-medium tracking-[0.04em] text-sky-100/55 sm:px-6">{locale === "zh" ? "正在读取本地传输状态..." : "Reading local transfer state..."}</p>}
-          </div>
-        </DialogContent>
-      </Dialog>
+      {files.length === 0 ? (
+        <WorkspaceEmptyState icon={<RiFolderTransferLine aria-hidden="true" className="size-10 text-sky-200/55" />} message={copy.empty} />
+      ) : (
+        <div className="space-y-3 pt-4">
+          <AnimatePresence initial={false}>
+            {files.map((file) => <FileTransferCard accent={accent} actions={actions} file={file} key={file.id} locale={locale} />)}
+          </AnimatePresence>
+        </div>
+      )}
     </WorkspaceShell>
   );
 }
@@ -2530,8 +2763,6 @@ function RoomWorkspace({
   connectionRoute,
   connectionNotice,
   chatController,
-  voiceActive,
-  videoActive,
 }: {
   chatMessages: ChatMessage[];
   chatSeatAdmitted: boolean;
@@ -2543,7 +2774,7 @@ function RoomWorkspace({
   onExitComplete?: () => void;
   onFeatureUsed: (feature: MeasuredFeature) => void;
   onLeave: () => void;
-  onMarkChatMessageRead: (id: string) => boolean;
+  onMarkChatMessageRead: (id: string, visibleImages: ReadonlySet<string>) => boolean;
   onChatTyping: () => void;
   onAcceptFile: (id: string) => void;
   onCancelFile: (id: string) => void;
@@ -2592,13 +2823,26 @@ function RoomWorkspace({
   connectionRoute: ConnectionRoute;
   connectionNotice: string | null;
   chatController: ChatController;
-  voiceActive: boolean;
-  videoActive: boolean;
 }) {
   const copy = roomCopy[locale];
   const { theme } = useTheme();
   const workspace = workspaceCopy[locale];
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId | null>(() => workspaceFromHash());
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId | null>(() => workspaceFromHash().active);
+  const [sideWorkspace, setSideWorkspace] = useState<SplitSideWorkspace | null>(() => workspaceFromHash().side);
+  // Split panes need real room; below lg the second pane is not rendered at
+  // all (state kept, so crossing the breakpoint restores the split) rather
+  // than hidden, keeping a single live workspace subtree.
+  const isDesktop = useMediaQuery("(min-width: 1024px)");
+  const splitActive = sideWorkspace !== null && isDesktop;
+  // The right pane is whichever of {collaborate, canvas} is in the pair; chat
+  // always owns the left column.
+  const splitPartner = splitActive
+    ? ([activeWorkspace, sideWorkspace] as const).find((id) => id === "canvas" || id === "collaborate") ?? null
+    : null;
+  // The chat pane is on screen either as the active workspace or as the left
+  // split column: new remote messages then are seen live, not "unread".
+  const chatVisible = activeWorkspace === "chat" || (splitActive && sideWorkspace === "chat");
+  const visibleWorkspaceIds = new Set<WorkspaceId>([activeWorkspace, splitActive ? sideWorkspace : null].filter((id): id is WorkspaceId => id !== null));
   const [focusedVideoTileId, setFocusedVideoTileId] = useState<VideoTile["id"] | null>(null);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [isExitDialogOpen, setExitDialogOpen] = useState(false);
@@ -2613,7 +2857,11 @@ function RoomWorkspace({
   }, []);
 
   useEffect(() => {
-    const syncWorkspaceFromHash = () => setActiveWorkspace(workspaceFromHash());
+    const syncWorkspaceFromHash = () => {
+      const parsed = workspaceFromHash();
+      setActiveWorkspace(parsed.active);
+      setSideWorkspace(parsed.side);
+    };
     window.addEventListener("hashchange", syncWorkspaceFromHash);
     return () => window.removeEventListener("hashchange", syncWorkspaceFromHash);
   }, []);
@@ -2621,14 +2869,14 @@ function RoomWorkspace({
   useEffect(() => {
     const newMessages = chatMessages.slice(observedChatMessageCount.current);
     observedChatMessageCount.current = chatMessages.length;
-    if (activeWorkspace === "chat") return;
+    if (chatVisible) return;
     const receivedCount = newMessages.filter((message) => message.sender === "remote").length;
     if (receivedCount) setUnreadChatCount((count) => count + receivedCount);
-  }, [activeWorkspace, chatMessages]);
+  }, [chatVisible, chatMessages]);
 
   useEffect(() => {
-    if (activeWorkspace === "chat") setUnreadChatCount(0);
-  }, [activeWorkspace]);
+    if (chatVisible) setUnreadChatCount(0);
+  }, [chatVisible]);
 
   const requestExit = () => {
     if (isExiting) return;
@@ -2644,10 +2892,24 @@ function RoomWorkspace({
   const activateWorkspace = (workspaceId: WorkspaceId) => {
     if (activeWorkspace !== workspaceId) trackInsightEvent("workspace_opened", { workspace: workspaceId });
     setActiveWorkspace(workspaceId);
+    setSideWorkspace(null);
     if (workspaceId === "chat") setUnreadChatCount(0);
-    const hash = `#${workspaceId}`;
+    const hash = formatWorkspaceHash(workspaceId, null);
     if (window.location.hash !== hash) window.history.pushState(null, "", hash);
     setRunningWorkspaces((current) => current.includes(workspaceId) ? current : [...current, workspaceId]);
+  };
+
+  const toggleSplit = (partner: Exclude<SplitSideWorkspace, "chat">) => {
+    const nextSide = splitPartner === partner ? null : partner;
+    setActiveWorkspace("chat");
+    setSideWorkspace(nextSide);
+    setUnreadChatCount(0);
+    const hash = formatWorkspaceHash("chat", nextSide);
+    if (window.location.hash !== hash) window.history.pushState(null, "", hash);
+    if (nextSide !== null) {
+      trackInsightEvent("workspace_opened", { workspace: nextSide });
+      setRunningWorkspaces((current) => current.includes(nextSide) ? current : [...current, nextSide]);
+    }
   };
 
   // Land a solo visitor straight in the conversation so they can leave
@@ -2661,30 +2923,51 @@ function RoomWorkspace({
     activateWorkspace("chat");
   }, [open, peerPresence, activeWorkspace]);
 
-  const fileRunning = fileTransfers.some((file) => file.state === "transferring");
-  const pendingFileRequests = fileTransfers.filter((file) => file.direction === "incoming" && file.state === "offered").length;
+  const pendingFileRequests = chatVisible ? 0 : fileTransfers.filter((file) => file.direction === "incoming" && file.state === "offered").length;
   const speakerActive = volume > 0 || screenShareVolume > 0 || sharedPlaybackVolume > 0;
+  const fileActions: FileTransferActions = {
+    onAccept: onAcceptFile,
+    onCancel: onCancelFile,
+    onDelete: onDeleteFile,
+    onDiagnostics: onFileDiagnostics,
+    onDownload: onDownloadFile,
+    onPause: onPauseFile,
+    onResend: onResendFile,
+  };
+  const chatWorkspace = (
+    <ChatWorkspace
+      accent={theme.accent}
+      banner={peerPresence === "solo" || peerPresence === "away" ? <ChatPresenceBanner locale={locale} mode={peerPresence} /> : undefined}
+      controller={chatController}
+      emptyMessage={workspace.chatEmpty}
+      fileActions={fileActions}
+      files={fileTransfers}
+      layout={splitActive ? "split" : "single"}
+      loadMoreLabel={workspace.chatLoadMore}
+      locale={locale}
+      messages={chatMessages}
+      onMarkRead={onMarkChatMessageRead}
+      onTyping={onChatTyping}
+      peerTyping={peerTyping}
+      ready={chatSeatAdmitted}
+      typingLabel={workspace.typing}
+    />
+  );
 
-  const dockItems: DockItemData[] = workspaceOrder.map((workspaceId) => {
+  const dockItems: DockItemData[] = dockWorkspaces.map((workspaceId) => {
     const Icon = workspaceIcons[workspaceId];
     return {
-      badge: workspaceId === "chat" ? unreadChatCount : workspaceId === "files" ? pendingFileRequests : undefined,
+      badge: workspaceId === "chat" ? unreadChatCount + pendingFileRequests : undefined,
       icon: <Icon aria-hidden="true" className="size-full" />,
       id: workspaceId,
-      isActive: activeWorkspace === workspaceId,
+      isActive: visibleWorkspaceIds.has(workspaceId),
       label: workspace.apps[workspaceId][0],
-      running: workspaceId === "files"
-        ? activeWorkspace !== "files" && fileRunning
-        : workspaceId === "voice"
-          ? activeWorkspace !== "voice" && voiceActive
-          : workspaceId === "video"
-            ? activeWorkspace !== "video" && videoActive
-            : workspaceId === "watch"
-              ? activeWorkspace !== "watch" && sharedPlayback !== null
-              : workspaceId === "collaborate"
-                ? collaborationPeerCursor
-                : workspaceId === "canvas" && activeWorkspace !== "canvas" && canvasHasContent,
-      onClick: () => activateWorkspace(workspaceId),
+      running: workspaceId === "collaborate" && !visibleWorkspaceIds.has("collaborate") && collaborationPeerCursor
+        || workspaceId === "canvas" && !visibleWorkspaceIds.has("canvas") && canvasHasContent,
+      onClick: () => {
+        if (isDesktop && workspaceId !== "chat") return toggleSplit(workspaceId);
+        activateWorkspace(workspaceId);
+      },
     };
   });
 
@@ -2761,10 +3044,20 @@ function RoomWorkspace({
               className="absolute inset-0 flex h-full min-h-0 w-full"
               duration={0.22}
               presenceMode="sync"
-              transitionKey={activeWorkspace ?? "ready"}
+              transitionKey={splitActive ? `split:${activeWorkspace}+${sideWorkspace}` : (activeWorkspace ?? "ready")}
               type="fade"
             >
-              {activeWorkspace === null ? (
+              {splitActive && splitPartner !== null ? (
+                <SplitWorkspaceLayout
+                  chat={chatWorkspace}
+                  dividerLabel={workspace.splitDivider}
+                  partner={splitPartner === "collaborate" ? (
+                    <CollaborationWorkspace accent={theme.accent} locale={locale} onFeatureUsed={() => onFeatureUsed("collaborate")} provider={collaborationProvider} />
+                  ) : (
+                    <CollaborationCanvas accent={theme.accent} key={collaborationProvider?.document.clientID ?? "pending"} locale={locale} onFeatureUsed={() => onFeatureUsed("canvas")} provider={collaborationProvider} />
+                  )}
+                />
+              ) : activeWorkspace === null ? (
                 <section className="flex min-h-0 w-full flex-1 items-center justify-center py-6 text-center">
                   <div className="w-full max-w-2xl">
                     {peerPresence === "active" ? (
@@ -2788,26 +3081,8 @@ function RoomWorkspace({
 
                 return (
                   <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
-                    {activeWorkspace === "chat" ? (
-                      <ChatWorkspace
-                        accent={theme.accent}
-                        banner={peerPresence === "solo" || peerPresence === "away" ? (
-                          <ChatPresenceBanner locale={locale} mode={peerPresence} />
-                        ) : undefined}
-                        emptyMessage={workspace.chatEmpty}
-                        loadMoreLabel={workspace.chatLoadMore}
-                        messages={chatMessages}
-                        onMarkRead={onMarkChatMessageRead}
-                        controller={chatController}
-                        locale={locale}
-                        onTyping={onChatTyping}
-                        peerTyping={peerTyping}
-                        placeholder={workspace.chatPlaceholder}
-                        ready={chatSeatAdmitted}
-                        typingLabel={workspace.typing}
-                      />
-                    ) : activeWorkspace === "files" ? (
-                      <FileWorkspace accent={theme.accent} files={fileTransfers} locale={locale} onAccept={onAcceptFile} onCancel={onCancelFile} onDelete={onDeleteFile} onDiagnostics={onFileDiagnostics} onDownload={onDownloadFile} onOffer={onOfferFiles} onPause={onPauseFile} onResend={onResendFile} ready={progress.dataChannel.state === "active"} />
+                    {activeWorkspace === "chat" ? chatWorkspace : activeWorkspace === "files" ? (
+                      <FileWorkspace accent={theme.accent} actions={fileActions} files={fileTransfers} locale={locale} onOffer={onOfferFiles} ready={progress.dataChannel.state === "active"} />
                     ) : activeWorkspace === "watch" ? (
                       <WatchWorkspace
                         accent={theme.accent}
@@ -3024,9 +3299,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       unsubscribe();
       store.dispose();
       if (chatImageStoreRef.current === store) chatImageStoreRef.current = null;
-      for (const pending of pendingChatUploadsRef.current.values()) for (const preview of pending.previews) URL.revokeObjectURL(preview.url);
       pendingChatUploadsRef.current.clear();
-      disposeChatComposerState(chatComposerStateRef.current);
     };
   }, [roomId]);
   const [fileTransfers, setFileTransfers] = useState<FileTransferSnapshot[]>([]);
@@ -3041,8 +3314,6 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const [microphoneError, setMicrophoneError] = useState<string | null>(null);
   const [microphonePending, setMicrophonePending] = useState(false);
   const [noiseReductionActive, setNoiseReductionActive] = useState(true);
-  const [remoteVoiceActive, setRemoteVoiceActive] = useState(false);
-  const [remoteVideoActive, setRemoteVideoActive] = useState(false);
   const [remoteAudioVersion, setRemoteAudioVersion] = useState(0);
   const [speakerVolume, setSpeakerVolume] = useState(1);
   const [cameraActive, setCameraActive] = useState(false);
@@ -3229,9 +3500,17 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   };
 
   const tryDeliverChatMessage = (session: NativeWebRTCSession, message: ChatMessage): void => {
-    if (message.sender !== "local" || message.deliveryStatus === "received" || message.deliveryStatus === "read" || pendingChatUploadsRef.current.has(message.id)) return;
-    if (message.rich && message.rich.images.some((image) => image.expiresAt <= Date.now())) {
-      updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "图片已过期，请重新选择图片发送。" : "Images expired. Choose them again to send a new copy." } : item));
+    if (message.sender !== "local" || message.deliveryStatus === "received" || message.deliveryStatus === "read"
+      || (message.uploadState && message.uploadState !== "complete") || pendingChatUploadsRef.current.has(message.id)) return;
+    const now = Date.now();
+    const expiredFile = message.rich?.files?.some((file) => file.expiresAt <= now);
+    if (expiredFile || message.rich?.images.some((image) => image.expiresAt <= now)) {
+      const imageError = chatImageErrorText(new ChatImageRequestError(410, expiredFile ? "file" : "image"), locale);
+      updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", uploadState: "expired", imageError } : item));
+      return;
+    }
+    if (message.rich?.version === 3 && session.chatFileSupport !== "supported") {
+      if (session.chatFileSupport === "unsupported") updateChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, deliveryStatus: "error", imageError: locale === "zh" ? "对方版本不支持聊天文件，请让对方刷新页面后重试。" : "The other participant needs to refresh before receiving chat files." } : item));
       return;
     }
     if (message.reply && session.chatReplySupport !== "supported") {
@@ -3256,44 +3535,63 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       return;
     }
     const signal = chatRoomAbortRef.current.signal;
-    const store = chatImageStoreRef.current;
-    if (signal.aborted || !store) return;
+    if (signal.aborted) return;
+    const queue = chatUploadQueueRef.current;
     pending.running = true;
     updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, uploadState: "uploading", deliveryStatus: "queued", imageError: undefined } : item));
     try {
-      const attempts = await Promise.allSettled(pending.draft.images.map(async (image) => {
-        const uploaded = pending.uploaded.get(image.id);
-        if (uploaded) {
-          if (uploaded.expiresAt <= Date.now()) throw new ChatImageRequestError(410);
-          return;
-        }
-        const value = await chatUploadQueueRef.current.upload(roomId, image.file, session, signal);
-        if (signal.aborted) return;
-        const reference = { ...value, width: image.width, height: image.height, name: image.file.name, original: image.original };
-        pending.uploaded.set(image.id, reference);
-        const preview = pending.previews.find((item) => item.id === image.id);
-        if (preview) { preview.image = reference; store.prime(reference, preview.url); }
-        updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, localImages: [...pending.previews], uploadCount: pending.uploaded.size } : item));
-      }));
+      const checkExpiry = () => {
+        const now = Date.now();
+        if ([...pending.uploadedFiles.values()].some((file) => file.expiresAt <= now)) throw new ChatImageRequestError(410, "file");
+        if ([...pending.uploadedImages.values()].some((image) => image.expiresAt <= now)) throw new ChatImageRequestError(410);
+      };
+      const updateAttachments = () => {
+        const attachments = attachmentState(pending);
+        updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, ...attachments } : item));
+      };
+      checkExpiry();
+      const attempts = await Promise.allSettled([
+        ...[...pending.images.values()].map(async (image) => {
+          const value = await queue.upload(roomId, image.file, session, signal);
+          if (signal.aborted) return;
+          pending.uploadedImages.set(image.id, { ...value, width: image.width, height: image.height, name: image.file.name, original: image.original });
+          pending.images.delete(image.id);
+          updateAttachments();
+        }),
+        ...[...pending.files].map(async ([localId, file]) => {
+          const value = await queue.uploadFile(roomId, file, session, signal);
+          if (signal.aborted) return;
+          pending.uploadedFiles.set(localId, value);
+          pending.files.delete(localId);
+          updateAttachments();
+        }),
+      ]);
       if (signal.aborted) return;
+      checkExpiry();
       const failed = attempts.find((attempt) => attempt.status === "rejected");
       if (failed?.status === "rejected") throw failed.reason;
-      const rich: RichChatMessage = {
-        id, type: "chat-rich", ...(pending.draft.reply ? { version: 2 as const, reply: pending.draft.reply } : { version: 1 as const }),
-        blocks: pending.draft.blocks.map((block) => block.type === "image" ? { type: "image", imageId: pending.uploaded.get(block.imageId)!.imageId } : block),
-        images: pending.draft.images.map((image) => pending.uploaded.get(image.id)!),
-      };
-      for (const image of pending.draft.images) {
-        const preview = pending.previews.find((item) => item.id === image.id);
-        if (preview) store.prime(pending.uploaded.get(image.id)!, preview.url);
+      const attachments = attachmentState(pending);
+      const base = { id, type: "chat-rich" as const, blocks: attachments.blocks, images: attachments.images };
+      const rich: RichChatMessage = attachments.files.length
+        ? { ...base, version: 3, files: attachments.files, ...(pending.reply ? { reply: pending.reply } : {}) }
+        : pending.reply ? { ...base, version: 2, reply: pending.reply } : { ...base, version: 1 };
+      if (!isRichChatMessage(rich)) {
+        pendingChatUploadsRef.current.delete(id);
+        const imageError = locale === "zh" ? "消息内容过大或无效，请拆成多条重新发送。" : "This message is too large or invalid. Split it into smaller messages and send again.";
+        updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, deliveryStatus: "error", uploadState: "invalid", imageError } : item));
+        return;
       }
       pendingChatUploadsRef.current.delete(id);
-      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, blocks: rich.blocks, images: rich.images, rich, localImages: undefined, uploadState: "complete" } : item));
+      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, ...attachments, rich, uploadState: "complete" } : item));
       const current = chatMessagesRef.current.find((item) => item.id === id);
       if (current && sessionRef.current) tryDeliverChatMessage(sessionRef.current, current);
     } catch (error) {
       if (signal.aborted) return;
-      updateChatMessages((current) => current.map((item) => item.id === id ? { ...item, deliveryStatus: "error", uploadState: "error", imageError: chatImageErrorText(error, locale) } : item));
+      const expired = error instanceof ChatImageRequestError && error.status === 410;
+      if (expired) pendingChatUploadsRef.current.delete(id);
+      updateChatMessages((current) => current.map((item) => item.id === id ? {
+        ...item, ...(expired ? { localImages: undefined } : {}), deliveryStatus: "error", uploadState: expired ? "expired" : "error", imageError: chatImageErrorText(error, locale),
+      } : item));
     } finally { pending.running = false; }
   };
 
@@ -3630,8 +3928,6 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     setCameraPending(false);
     setScreenShareActive(false);
     setScreenAudioFallbackOpen(false);
-    setRemoteVoiceActive(false);
-    setRemoteVideoActive(false);
     setConnectionRoute("direct");
     return true;
   };
@@ -3705,7 +4001,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           sender: "remote",
           sentAt: Date.now(),
           text: message.type === "chat" ? message.text : message.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n"),
-          ...(message.type === "chat-rich" ? { blocks: message.blocks, images: message.images, rich: message, ...(message.version === 2 ? { reply: message.reply } : {}) } : {}),
+          ...(message.type === "chat-rich" ? { blocks: message.blocks, images: message.images, files: message.files, reply: message.reply, rich: message } : {}),
         }));
       },
       (id, status) => {
@@ -3782,18 +4078,12 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     sessionRef.current = session;
     const unsubscribeChatCapabilities = session.subscribeChatImageSupport(() => resumeChatMessages(session));
     const unsubscribeReplyCapabilities = session.subscribeChatReplySupport(() => resumeChatMessages(session));
+    const unsubscribeFileCapabilities = session.subscribeChatFileSupport(() => resumeChatMessages(session));
     connectionReportedRef.current = false;
     replaceCollaborationProvider(session);
     setMediaTransport(session.media);
-    const unsubscribeMedia = session.media.subscribe((slots) => {
-      const remoteAudio = slots.find((slot) => slot.id === "camera-audio");
-      const remoteVideo = slots.some((slot) => (slot.id === "camera-video" || slot.id === "screen-video") && slot.remoteState === "live");
+    const unsubscribeMedia = session.media.subscribe(() => {
       setRemoteAudioVersion((version) => version + 1);
-      setRemoteVoiceActive((current) => {
-        const next = remoteAudio?.remoteState === "live";
-        return current === next ? current : next;
-      });
-      setRemoteVideoActive((current) => current === remoteVideo ? current : remoteVideo);
     });
     session.attachFileTransferManager(fileManagerRef.current);
     session.connect();
@@ -3820,6 +4110,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       unsubscribeMedia();
       unsubscribeChatCapabilities();
       unsubscribeReplyCapabilities();
+      unsubscribeFileCapabilities();
       rawMicrophoneTrackRef.current?.stop();
       rawMicrophoneTrackRef.current = null;
       cameraTrackRef.current?.stop();
@@ -3839,8 +4130,6 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       setMicrophoneDeviceId(null);
       setMicrophonePending(false);
       setNoiseReductionActive(true);
-      setRemoteVoiceActive(false);
-      setRemoteVideoActive(false);
       setSpeakerVolume(1);
       setCameraActive(false);
       setCameraDeviceId(null);
@@ -3858,8 +4147,6 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const leave = () => {
     chatRoomAbortRef.current.abort();
     chatImageStoreRef.current?.dispose();
-    disposeChatComposerState(chatComposerStateRef.current);
-    for (const pending of pendingChatUploadsRef.current.values()) for (const preview of pending.previews) URL.revokeObjectURL(preview.url);
     pendingChatUploadsRef.current.clear();
     disposePeerSessionScope();
     sessionRef.current?.close();
@@ -3926,7 +4213,8 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   const sendChatMessage = (draft: ChatComposerSubmit): boolean => {
     const text = draft.blocks.filter((block) => block.type === "paragraph").map((block) => block.text).join("\n");
-    if (!text.trim() && !draft.images.length) return false;
+    const uploadTotal = draft.images.length + draft.files.length;
+    if (!text.trim() && !uploadTotal) return false;
     if (text.length > 4_000) { setChatComposerError(locale === "zh" ? "消息文字不能超过 4,000 字符。" : "Messages can contain up to 4,000 text characters."); return false; }
     const session = sessionRef.current;
     if (draft.reply && session?.chatReplySupport === "unsupported") {
@@ -3937,13 +4225,43 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       setChatComposerError(locale === "zh" ? "对方版本不支持图文消息，请让对方刷新页面。" : "The other participant needs to refresh before receiving images.");
       return false;
     }
+    if (draft.files.length && session?.chatFileSupport === "unsupported") {
+      setChatComposerError(locale === "zh" ? "对方版本不支持聊天文件，请让对方刷新页面。" : "The other participant needs to refresh before receiving chat files.");
+      return false;
+    }
+    const fileBytes = draft.files.reduce((size, { file }) => size + file.size, 0);
+    if (fileBytes > CHAT_FILES_MAX_BYTES || draft.files.some(({ file }) => file.size > CHAT_FILE_MAX_BYTES || !isChatFileName(file.name))) {
+      setChatComposerError(locale === "zh" ? "文件名无效或超过附件大小限制。" : "A file name is invalid or the attachments exceed the size limit.");
+      return false;
+    }
+    if (uploadTotal) {
+      let pendingBytes = fileBytes + draft.images.reduce((size, image) => size + image.file.size, 0);
+      for (const pending of pendingChatUploadsRef.current.values()) {
+        for (const file of pending.files.values()) pendingBytes += file.size;
+        for (const image of pending.images.values()) pendingBytes += image.file.size;
+      }
+      if (pendingBytes > CHAT_ROOM_PENDING_FILE_BYTES) {
+        setChatComposerError(locale === "zh" ? "待上传附件超过 200 MiB。请等待当前上传或重试完成。" : "Pending uploads exceed 200 MiB. Wait for the current uploads or retries to finish.");
+        return false;
+      }
+    }
     const id = cuid();
+    if (draft.files.length && !cloudFileMessageFits(draft, id)) {
+      setChatComposerError(locale === "zh" ? "消息内容过大或无效，请拆成多条发送。" : "This message is too large or invalid. Split it into smaller messages.");
+      return false;
+    }
     setChatComposerError(null);
-    if (draft.images.length) {
-      // The editor releases its preview URLs when accepted; the room owns copies.
-      const previews = draft.images.map((image) => ({ id: image.id, url: URL.createObjectURL(image.file), width: image.width, height: image.height, name: image.file.name }));
-      pendingChatUploadsRef.current.set(id, { draft, previews, uploaded: new Map(), running: false });
-      updateChatMessages((current) => appendChatMessage(current, { id, text, blocks: draft.blocks, reply: draft.reply, localImages: previews, sender: "local", sentAt: Date.now(), deliveryStatus: "queued", uploadState: "waiting", uploadCount: 0 }));
+    if (uploadTotal) {
+      const pending: PendingChatUpload = {
+        blocks: draft.blocks, reply: draft.reply,
+        images: new Map(draft.images.map(({ sourceFile: _sourceFile, ...image }) => [image.id, image])),
+        files: new Map(draft.files.map(({ id, file }) => [id, file])),
+        uploadedImages: new Map(), uploadedFiles: new Map(), running: false,
+      };
+      pendingChatUploadsRef.current.set(id, pending);
+      updateChatMessages((current) => appendChatMessage(current, {
+        ...attachmentState(pending), id, text, reply: draft.reply, sender: "local", sentAt: Date.now(), deliveryStatus: "queued", uploadState: "waiting", uploadTotal,
+      }));
       void processChatUpload(id);
     } else if (draft.reply) {
       const rich: RichChatMessage = { id, type: "chat-rich", version: 2, blocks: draft.blocks, images: [], reply: draft.reply };
@@ -3958,11 +4276,10 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     return true;
   };
 
-  const markChatMessageRead = (id: string): boolean => {
+  const markChatMessageRead = (id: string, visibleImages: ReadonlySet<string>): boolean => {
     const message = chatMessagesRef.current.find((item) => item.id === id);
     if (message?.images?.some((image) => {
-      const state = chatImageStoreRef.current?.snapshot(image).state;
-      return state !== "ready" && state !== "expired";
+      return visibleImages.has(image.imageId) && chatImageStoreRef.current?.isReadBlocked(image, true);
     })) return false;
     return sessionRef.current?.markChatMessageRead(id) ?? false;
   };
@@ -4433,8 +4750,6 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           roomId={roomId}
           connectionRoute={connectionRoute}
           connectionNotice={connectionNotice}
-          voiceActive={microphoneActive || remoteVoiceActive}
-          videoActive={cameraActive || screenShareActive || remoteVideoActive}
         />
       ) : (
         <ConnectionDialog

@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { Room } from "./room";
 import { cleanupExpiredChatImages, downloadChatImage, uploadChatImage } from "./chat-images";
+import { cleanupExpiredChatAttachments, downloadChatAttachment, uploadChatAttachment } from "./chat-attachments";
 
 type ApiBindings = Env & {
   TURN_ID?: string;
@@ -119,6 +120,14 @@ app.use("/api/rooms/:roomId/chat-images", async (context, next) => {
   await next();
   context.header("Cache-Control", "private, no-store");
 });
+app.use("/api/chat-files/*", async (context, next) => {
+  await next();
+  context.header("Cache-Control", "private, no-store");
+});
+app.use("/api/rooms/:roomId/chat-files", async (context, next) => {
+  await next();
+  context.header("Cache-Control", "private, no-store");
+});
 
 app.get("/api/rooms/:roomId/ws", async (context) => {
   const roomId = context.req.param("roomId");
@@ -137,9 +146,20 @@ app.post("/api/rooms/:roomId/chat-images", (context) => {
 });
 
 app.get("/api/chat-images/:imageId", (context) => downloadChatImage(context.req.raw, context.env, context.req.param("imageId")));
+app.post("/api/chat-images/:imageId/download", (context) => downloadChatAttachment(context.req.raw, context.env, context.req.param("imageId"), "image"));
+
+app.post("/api/rooms/:roomId/chat-files", (context) => {
+  const roomId = context.req.param("roomId");
+  if (!roomIsValid(roomId)) return context.json({ message: "Invalid room ID." }, 400);
+  return uploadChatAttachment(context.req.raw, context.env, roomId, "file");
+});
+app.post("/api/chat-files/:fileId/download", (context) => downloadChatAttachment(context.req.raw, context.env, context.req.param("fileId"), "file"));
 
 app.all("/api/rooms/:roomId/chat-images", () => methodNotAllowed("Method not allowed"));
 app.all("/api/chat-images/:imageId", () => methodNotAllowed("Method not allowed"));
+app.all("/api/chat-images/:imageId/download", () => methodNotAllowed("Method not allowed"));
+app.all("/api/rooms/:roomId/chat-files", () => methodNotAllowed("Method not allowed"));
+app.all("/api/chat-files/:fileId/download", () => methodNotAllowed("Method not allowed"));
 
 app.post("/api/turn/credentials", async (context) => {
   if (!context.env.TURN_ID || !context.env.TURN_TOKEN) {
@@ -191,5 +211,6 @@ export default {
   fetch: app.fetch,
   scheduled(event, env, context) {
     context.waitUntil(cleanupExpiredChatImages(env, event.scheduledTime));
+    context.waitUntil(cleanupExpiredChatAttachments(env, "file", event.scheduledTime));
   },
 } satisfies ExportedHandler<ApiBindings>;

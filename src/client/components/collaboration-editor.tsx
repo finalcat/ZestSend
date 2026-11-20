@@ -191,6 +191,12 @@ function CollaborationEditor({ accent, locale, onFeatureUsed, provider }: { acce
     observer.observe(editorRoot, { childList: true, subtree: true });
     scrollContainer?.addEventListener("scroll", schedulePosition, { passive: true });
     window.addEventListener("resize", schedulePosition);
+    // Split-pane divider drags resize the editor without a window resize
+    // event; reposition carets off the container's own size changes too.
+    const resizeObserver = scrollContainer instanceof HTMLElement
+      ? new ResizeObserver(schedulePosition)
+      : null;
+    if (scrollContainer && resizeObserver) resizeObserver.observe(scrollContainer);
     schedulePosition();
 
     return () => {
@@ -198,6 +204,7 @@ function CollaborationEditor({ accent, locale, onFeatureUsed, provider }: { acce
       if (frame) window.cancelAnimationFrame(frame);
       scrollContainer?.removeEventListener("scroll", schedulePosition);
       window.removeEventListener("resize", schedulePosition);
+      resizeObserver?.disconnect();
       exitLayer.remove();
     };
   }, [tiptap]);

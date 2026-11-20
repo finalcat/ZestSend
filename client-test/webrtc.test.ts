@@ -186,7 +186,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function richMessage(): RichChatMessage {
+function richMessage(): Extract<RichChatMessage, { version: 1 }> {
   const expiresAt = 1_794_027_600_000;
   const imageId = `${expiresAt}-${"a".repeat(32)}`;
   return {
@@ -217,6 +217,28 @@ function replyMessage(withImage = false): RichChatMessage {
 }
 
 describe("reply capability compatibility", () => {
+  it("negotiates cloud files independently and leaves old text and images usable", async () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances[0];
+    const control = openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    const expiresAt = 1_794_027_600_000;
+    const file = { fileId: `${expiresAt}-${"a".repeat(32)}`, readToken: "r".repeat(43), expiresAt, name: "example.bin", size: 1 };
+    const message: RichChatMessage = { type: "chat-rich", id: "file", version: 3, images: [], files: [file], blocks: [{ type: "file", fileId: file.fileId }] };
+    const capability = JSON.stringify({ type: "chat-file-capabilities", version: 1, richFiles: true });
+    expect(control.send).toHaveBeenCalledWith(capability);
+    expect(session.sendRichChatMessage(message)).toBe(false);
+    control.onmessage?.({ data: JSON.stringify({ type: "chat-capabilities", version: 1, richImages: true }) });
+    expect(session.sendRichChatMessage(richMessage())).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(session.chatFileSupport).toBe("unsupported");
+    expect(session.sendChatMessage("legacy", "text still works")).toBe(true);
+    control.onmessage?.({ data: capability });
+    expect(session.chatFileSupport).toBe("supported");
+    expect(session.sendRichChatMessage(message)).toBe(true);
+    expect(interactive.send).toHaveBeenCalledWith(JSON.stringify(message));
+  });
+
   it("negotiates separately from image support and accepts late declarations", async () => {
     const { session } = start(true);
     const listener = vi.fn();

@@ -8,7 +8,8 @@ type Transport = "direct" | "relay";
 
 type ReadReceiptProbe = {
   channels: Array<{ peer: RTCPeerConnection; channel: RTCDataChannel }>;
-  dropNextRead: boolean;
+  dropReadForText: string | null;
+  targetReadId: string | null;
   droppedReadIds: string[];
   receivedReadIds: string[];
 };
@@ -47,7 +48,7 @@ async function installProbe(page: Page, transport: Transport) {
   });
 
   await page.addInitScript((mode) => {
-    const probe: ReadReceiptProbe = { channels: [], dropNextRead: false, droppedReadIds: [], receivedReadIds: [] };
+    const probe: ReadReceiptProbe = { channels: [], dropReadForText: null, targetReadId: null, droppedReadIds: [], receivedReadIds: [] };
     window.__chatReadRecovery = probe;
 
     const readId = (data: unknown): string | undefined => {
@@ -60,6 +61,17 @@ async function installProbe(page: Page, transport: Transport) {
 
     const observeChannel = (peer: RTCPeerConnection, channel: RTCDataChannel) => {
       probe.channels.push({ peer, channel });
+      if (channel.label === "interactive") {
+        channel.addEventListener("message", ({ data }) => {
+          if (!probe.dropReadForText || typeof data !== "string") return;
+          try {
+            const message = JSON.parse(data);
+            if (message.type === "chat" && message.text === probe.dropReadForText && typeof message.id === "string") {
+              probe.targetReadId = message.id;
+            }
+          } catch { /* Other channel traffic need not be JSON. */ }
+        });
+      }
       if (channel.label !== "control") return;
       channel.addEventListener("message", ({ data }) => {
         const id = readId(data);
@@ -68,8 +80,9 @@ async function installProbe(page: Page, transport: Transport) {
       const send = channel.send.bind(channel) as (data: unknown) => void;
       Object.defineProperty(channel, "send", { value(data: unknown) {
         const id = readId(data);
-        if (id && probe.dropNextRead) {
-          probe.dropNextRead = false;
+        if (id && id === probe.targetReadId) {
+          probe.dropReadForText = null;
+          probe.targetReadId = null;
           probe.droppedReadIds.push(id);
           return;
         }
@@ -148,7 +161,7 @@ async function expectNormalRead(sender: Page, reader: Page, text: string) {
 }
 
 async function expectReadAfterRefresh(sender: Page, reader: Page, text: string, transport: Transport) {
-  await reader.evaluate(() => { window.__chatReadRecovery.dropNextRead = true; });
+  await reader.evaluate((target) => { window.__chatReadRecovery.dropReadForText = target; }, text);
   await send(sender, text);
   await reader.bringToFront();
   const incoming = message(reader, text);

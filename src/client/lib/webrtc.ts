@@ -48,10 +48,13 @@ import {
   CHAT_MESSAGE_MAX_BYTES,
   CHAT_TEXT_MAX_LENGTH,
   isChatCapabilitiesMessage,
+  isChatFileCapabilitiesMessage,
   isChatReplyCapabilitiesMessage,
   isInteractiveMessage,
   isRichChatMessage,
   type ChatCapabilitiesMessage,
+  type ChatFileCapabilitiesMessage,
+  type ChatFileSupport,
   type ChatReplyCapabilitiesMessage,
   type ChatReplySupport,
   type ChatImageSupport,
@@ -113,7 +116,7 @@ type ChatTypingMessage = {
   type: "chat-typing";
 };
 
-type DataChannelControlMessage = DataChannelPingMessage | ChatReceiptMessage | ChatTypingMessage | ChatCapabilitiesMessage | ChatReplyCapabilitiesMessage | MediaSlotControlMessage | SharedPlaybackMessage;
+type DataChannelControlMessage = DataChannelPingMessage | ChatReceiptMessage | ChatTypingMessage | ChatCapabilitiesMessage | ChatReplyCapabilitiesMessage | ChatFileCapabilitiesMessage | MediaSlotControlMessage | SharedPlaybackMessage;
 
 type DataChannelName = "bulk" | "collaboration" | "control" | "interactive";
 
@@ -602,6 +605,9 @@ export class NativeWebRTCSession {
   private chatImageSupportListeners = new Set<(support: ChatImageSupport) => void>();
   private chatImageSupportState: ChatImageSupport = "unknown";
   private chatImageSupportTimer: number | undefined;
+  private chatFileSupportListeners = new Set<(support: ChatFileSupport) => void>();
+  private chatFileSupportState: ChatFileSupport = "unknown";
+  private chatFileSupportTimer: number | undefined;
   private imageUploadAuthorizationListeners = new Set<() => void>();
   private closed = false;
   private suspended = false;
@@ -899,6 +905,14 @@ export class NativeWebRTCSession {
     return () => this.chatImageSupportListeners.delete(listener);
   }
 
+  get chatFileSupport(): ChatFileSupport { return this.chatFileSupportState; }
+
+  subscribeChatFileSupport(listener: (support: ChatFileSupport) => void): () => void {
+    this.chatFileSupportListeners.add(listener);
+    listener(this.chatFileSupportState);
+    return () => this.chatFileSupportListeners.delete(listener);
+  }
+
   /** Upload authorization is distinct from P2P health and must still be verified by the server. */
   getImageUploadAuthorization(): string | null {
     if (this.closed || this.suspended || !this.hasAdmittedSeat
@@ -941,7 +955,8 @@ export class NativeWebRTCSession {
   sendRichChatMessage(message: RichChatMessage): boolean {
     if (!isRichChatMessage(message)
       || (message.images.length > 0 && this.chatImageSupportState !== "supported")
-      || (message.version === 2 && this.chatReplySupportState !== "supported")) return false;
+       || (message.reply && this.chatReplySupportState !== "supported")
+       || (message.version === 3 && this.chatFileSupportState !== "supported")) return false;
     return this.sendOnChannel("interactive", JSON.stringify(message));
   }
 
@@ -961,9 +976,23 @@ export class NativeWebRTCSession {
     for (const listener of this.chatImageSupportListeners) listener(support);
   }
 
+  private setChatFileSupport(support: ChatFileSupport): void {
+    if (this.chatFileSupportTimer !== undefined) window.clearTimeout(this.chatFileSupportTimer);
+    this.chatFileSupportTimer = undefined;
+    if (this.chatFileSupportState === support) return;
+    this.chatFileSupportState = support;
+    for (const listener of this.chatFileSupportListeners) listener(support);
+  }
+
   private announceChatCapabilities(channel: RTCDataChannel): void {
     this.sendDataChannelControl({ type: "chat-capabilities", version: 1, richImages: true });
     this.sendDataChannelControl({ type: "chat-reply-capabilities", version: 1, replies: true });
+    this.sendDataChannelControl({ type: "chat-file-capabilities", version: 1, richFiles: true });
+    if (this.chatFileSupportState === "unknown") {
+      this.chatFileSupportTimer = window.setTimeout(() => {
+        if (this.channels.control === channel && !this.closed && !this.suspended) this.setChatFileSupport("unsupported");
+      }, 2_000);
+    }
     if (this.chatReplySupportState === "unknown") {
       this.chatReplySupportTimer = window.setTimeout(() => {
         if (this.channels.control === channel && !this.closed && !this.suspended) this.setChatReplySupport("unsupported");
@@ -1580,6 +1609,7 @@ export class NativeWebRTCSession {
     if (name === "control" && previous !== channel) {
       this.setChatImageSupport("unknown");
       this.setChatReplySupport("unknown");
+      this.setChatFileSupport("unknown");
     }
     this.channels[name] = channel; channel.binaryType = "arraybuffer"; this.updateDataChannelProgress();
     channel.onopen = () => {
@@ -1800,6 +1830,12 @@ export class NativeWebRTCSession {
     if (typeof data !== "string") return;
     let message: DataChannelControlMessage;
     try { message = JSON.parse(data) as DataChannelControlMessage; } catch { return; }
+    if (isChatFileCapabilitiesMessage(message)) {
+      const newlySupported = this.chatFileSupportState !== "supported";
+      this.setChatFileSupport("supported");
+      if (newlySupported) this.sendDataChannelControl({ type: "chat-file-capabilities", version: 1, richFiles: true });
+      return;
+    }
     if (isChatReplyCapabilitiesMessage(message)) {
       const newlySupported = this.chatReplySupportState !== "supported";
       this.setChatReplySupport("supported");
@@ -1842,7 +1878,8 @@ export class NativeWebRTCSession {
       if (!isInteractiveMessage(message)) return;
       if (message.type === "chat-rich") {
         if (message.images.length > 0 || message.version === 1) this.setChatImageSupport("supported");
-        if (message.version === 2) this.setChatReplySupport("supported");
+        if (message.reply) this.setChatReplySupport("supported");
+        if (message.version === 3) this.setChatFileSupport("supported");
       }
       this.sendDataChannelControl({ id: message.id, type: "chat-received" });
       if (this.receivedChatScopes.has(message.id)) return;
@@ -1945,6 +1982,7 @@ export class NativeWebRTCSession {
     }
     this.setChatImageSupport("unknown");
     this.setChatReplySupport("unknown");
+    this.setChatFileSupport("unknown");
     if (collaborationWasReady) this.notifyCollaborationStatus(false);
   }
   private notifyCollaborationStatus(ready: boolean): void {

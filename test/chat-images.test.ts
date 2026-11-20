@@ -3,13 +3,17 @@ import { createExecutionContext, createScheduledController, runInDurableObject, 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/worker/index";
 import { cleanupExpiredChatImages } from "../src/worker/chat-images";
+import { CHAT_FILE_ID_PATTERN, CHAT_FILE_MAX_BYTES } from "../src/shared/chat-file-limits";
 import { CHAT_IMAGE_MAX_BYTES, CHAT_IMAGE_TTL_MS } from "../src/shared/chat-image-limits";
 
 type Welcome = { type: string; resumeToken: string; slotId: string; peerSessionId: string; epoch: number };
 type UploadedImage = { imageId: string; readToken: string; expiresAt: number; mimeType: string; size: number };
+type UploadedFile = { fileId: string; readToken: string; expiresAt: number; name: string; size: number };
 const sockets = new Set<WebSocket>();
 let nextRoom = 9300;
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0, 1, 2, 3, 4]);
+const fileName = "测试 (原件).txt";
+const fileBytes = new Uint8Array([1, 2, 3, 4, 5]);
 
 async function seat(roomId = String(nextRoom++), mode = "new", resumeToken?: string) {
   const stub = env.ROOMS.getByName(roomId);
@@ -45,8 +49,25 @@ function upload(roomId: string, token: string, body: Uint8Array<ArrayBuffer> = p
   });
 }
 
-function key(imageId: string) {
-  return `chat-images/${new Date(Number(imageId.slice(0, 13))).toISOString().slice(0, 13)}/${imageId}`;
+function uploadFile(roomId: string, token: string, body: Uint8Array<ArrayBuffer> | null = fileBytes, headers: Record<string, string> = {}) {
+  return api(`/api/rooms/${roomId}/chat-files`, {
+    method: "POST", body,
+    headers: {
+      Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream", "Content-Length": String(body?.byteLength ?? 0),
+      "X-File-Name": encodeURIComponent(fileName), ...headers,
+    },
+  });
+}
+
+function nativeDownload(kind: "file" | "image", id: string, token: string, headers: Record<string, string> = {}) {
+  return api(`/api/chat-${kind}s/${id}/download`, {
+    method: "POST", body: new URLSearchParams({ readToken: token }),
+    headers: { Origin: "https://zestsend.test", ...headers },
+  });
+}
+
+function key(id: string, kind: "images" | "files" = "images") {
+  return `chat-${kind}/${new Date(Number(id.slice(0, 13))).toISOString().slice(0, 13)}/${id}`;
 }
 
 afterEach(async () => {
@@ -54,6 +75,114 @@ afterEach(async () => {
   sockets.clear();
   const page = await env.CHAT_IMAGES.list();
   if (page.objects.length) await env.CHAT_IMAGES.delete(page.objects.map((object) => object.key));
+});
+
+describe("private temporary chat files", () => {
+  it("uploads with a solo room seat and streams an authenticated native attachment", async () => {
+    const sender = await seat();
+    const startedAt = Date.now();
+    expect((await uploadFile(sender.roomId, "wrong-token")).status).toBe(401);
+    const response = await uploadFile(sender.roomId, sender.welcome.resumeToken);
+    expect(response.status).toBe(201);
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    const file = await response.json<UploadedFile>();
+    expect(file).toMatchObject({ name: fileName, size: fileBytes.byteLength });
+    expect(file.fileId).toMatch(CHAT_FILE_ID_PATTERN);
+    expect(file.readToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(file.expiresAt).toBe(Number(file.fileId.slice(0, 13)));
+    expect(file.expiresAt).toBeGreaterThanOrEqual(startedAt + CHAT_IMAGE_TTL_MS);
+    const object = await env.CHAT_IMAGES.head(key(file.fileId, "files"));
+    expect(object?.customMetadata?.readTokenHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(object?.customMetadata)).not.toContain(file.readToken);
+    expect(await env.CHAT_IMAGES.head(key(file.fileId))).toBeNull();
+    expect((await nativeDownload("file", file.fileId, "wrong-token")).status).toBe(401);
+    expect((await nativeDownload("file", file.fileId, "x".repeat(43))).status).toBe(404);
+    expect((await nativeDownload("file", file.fileId, file.readToken, { Origin: "https://other.test" })).status).toBe(403);
+    expect((await api(`/api/chat-files/${file.fileId}/download`)).status).toBe(405);
+
+    const downloaded = await nativeDownload("file", file.fileId, file.readToken);
+    expect(downloaded.status).toBe(200);
+    expect(downloaded.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(downloaded.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(downloaded.headers.get("Content-Length")).toBe(String(fileBytes.byteLength));
+    expect(downloaded.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(downloaded.headers.get("Content-Disposition")).toBe("attachment; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%28%E5%8E%9F%E4%BB%B6%29.txt");
+    expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(fileBytes);
+  });
+
+  it("accepts empty files and rejects mismatched stream sizes, unsafe filenames, and oversized declarations", async () => {
+    const { roomId, welcome } = await seat();
+    const token = welcome.resumeToken;
+    expect((await uploadFile(roomId, token, fileBytes, { "Content-Length": String(CHAT_FILE_MAX_BYTES + 1) })).status).toBe(413);
+    expect((await uploadFile(roomId, token, fileBytes, { "Content-Length": "0" })).status).toBe(400);
+    expect((await uploadFile(roomId, token, fileBytes, { "Content-Length": "6" })).status).toBe(400);
+    expect((await uploadFile(roomId, token, fileBytes, { "X-File-Name": encodeURIComponent("escape/invalid.txt") })).status).toBe(400);
+
+    const chunks = [fileBytes.subarray(0, 3), fileBytes.subarray(3)];
+    const invalid = await api(`/api/rooms/${roomId}/chat-files`, {
+      method: "POST",
+      body: new ReadableStream<Uint8Array>({ start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      } }),
+      headers: { Authorization: `Bearer ${token}`, "Content-Length": "3" },
+    });
+    expect(invalid.status).toBe(400);
+    expect((await env.CHAT_IMAGES.list({ prefix: "chat-files/" })).objects).toHaveLength(0);
+
+    const empty = await uploadFile(roomId, token, null);
+    expect(empty.status).toBe(201);
+    const file = await empty.json<UploadedFile>();
+    expect(file.size).toBe(0);
+    const downloaded = await nativeDownload("file", file.fileId, file.readToken);
+    expect(downloaded.status).toBe(200);
+    expect(downloaded.headers.get("Content-Length")).toBe("0");
+    expect((await downloaded.arrayBuffer()).byteLength).toBe(0);
+  });
+
+  it("shares seat reservations and byte quotas with images", async () => {
+    const { roomId, stub, welcome } = await seat();
+    const token = welcome.resumeToken;
+    const image = await stub.beginChatImageUpload(token, 1);
+    const file = await stub.beginChatFileUpload(token, CHAT_FILE_MAX_BYTES);
+    expect(image.ok && file.ok).toBe(true);
+    expect((await uploadFile(roomId, token)).status).toBe(429);
+    if (image.ok) await stub.finishChatAttachmentUpload(image.slotId, image.uploadId, 1);
+    if (file.ok) await stub.finishChatAttachmentUpload(file.slotId, file.uploadId, CHAT_FILE_MAX_BYTES);
+    for (const size of [CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_BYTES - 1]) {
+      const next = await stub.beginChatFileUpload(token, size);
+      expect(next.ok).toBe(true);
+      if (next.ok) await stub.finishChatAttachmentUpload(next.slotId, next.uploadId, size);
+    }
+    expect(await stub.beginChatImageUpload(token, 1)).toMatchObject({ ok: false, status: 429 });
+  });
+
+  it("supports originals via native downloads and enforces expiry before both prefixes are cleaned", async () => {
+    const { roomId, welcome } = await seat();
+    const file = await (await uploadFile(roomId, welcome.resumeToken)).json<UploadedFile>();
+    const image = await (await upload(roomId, welcome.resumeToken)).json<UploadedImage>();
+    const original = await nativeDownload("image", image.imageId, image.readToken);
+    expect(original.headers.get("Content-Disposition")).toMatch(/^attachment;/);
+    expect(new Uint8Array(await original.arrayBuffer())).toEqual(png);
+    const invalid = await nativeDownload("file", file.fileId, file.readToken, { "Content-Length": "513" });
+    expect(invalid.status).toBe(401);
+
+    const deadline = Math.max(file.expiresAt, image.expiresAt);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(deadline);
+    try {
+      const expired = await nativeDownload("file", file.fileId, file.readToken);
+      expect(expired.status).toBe(410);
+      expect(await expired.json()).toMatchObject({ status: 410 });
+      expect(await env.CHAT_IMAGES.head(key(file.fileId, "files"))).not.toBeNull();
+      const context = createExecutionContext();
+      worker.scheduled(createScheduledController({ cron: "0 * * * *", scheduledTime: deadline }), env, context);
+      await waitOnExecutionContext(context);
+      expect(await env.CHAT_IMAGES.head(key(file.fileId, "files"))).toBeNull();
+      expect(await env.CHAT_IMAGES.head(key(image.imageId))).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
 });
 
 describe("private temporary chat image API", () => {
