@@ -529,10 +529,15 @@ export function stopObservingIceServers(listener: IcePreparationListener): void 
 const V2_RECONNECT_DELAYS = [250, 500, 1_000, 2_000, 4_000, 5_000] as const;
 const MAX_SIGNALING_HEARTBEAT_MISSES = 4;
 const SEAT_LEASE_LOCAL_GRACE_MS = 5_000;
+const CHAT_READ_RECEIPT_LIMIT = 512;
 type V2HelloMode = "new" | "resume-signaling" | "restart-peer";
 
 function v2ResumeKey(roomId: string): string {
   return `zestsend:room:${encodeURIComponent(roomId)}:resume`;
+}
+
+function readReceiptStorageKey(roomId: string): string {
+  return `zestsend:room:${encodeURIComponent(roomId)}:read-receipts`;
 }
 
 function v2ReadResumeToken(roomId: string): string | null {
@@ -657,14 +662,9 @@ export class NativeWebRTCSession {
   private dataChannelPingTimeout: number | undefined;
   private receivedBytes = 0;
   private sentBytes = 0;
-  private receivedChatIds = new Set<string>();
-  // Read receipts are fire-and-forget on the control channel: a send that
-  // returns true can still vanish when the SCTP transport tears down right
-  // after it (common on relayed links). Track acknowledged-read ids so every
-  // control-channel (re)open replays them; the receiving side treats
-  // chat-read as idempotent (status only ever advances).
-  private readonly readReceiptIds: string[] = [];
-  private readonly readReceiptSet = new Set<string>();
+  private readonly receivedChatScopes = new Map<string, string | null>();
+  private readReceiptScope: string | null = null;
+  private readonly readReceiptIds = new Set<string>();
   private fileTransferManager: FileTransferManager | null = null;
   private mediaTransport: MediaTransport;
 
@@ -1845,8 +1845,9 @@ export class NativeWebRTCSession {
         if (message.version === 2) this.setChatReplySupport("supported");
       }
       this.sendDataChannelControl({ id: message.id, type: "chat-received" });
-      if (this.receivedChatIds.has(message.id)) return;
-      this.receivedChatIds.add(message.id); this.onInteractiveMessage(message);
+      if (this.receivedChatScopes.has(message.id)) return;
+      this.receivedChatScopes.set(message.id, this.chatReceiptScope());
+      this.onInteractiveMessage(message);
     } catch { /* malformed application messages are ignored */ }
   }
 
@@ -1866,19 +1867,53 @@ export class NativeWebRTCSession {
     this.dataChannelPingTimeout = window.setTimeout(() => { this.dataChannelPingStartedAt = null; this.dataChannelPingTimeout = undefined; }, 5_000);
   }
   private sendDataChannelControl(message: DataChannelControlMessage): void { this.sendOnChannel("control", JSON.stringify(message)); }
+
+  private chatReceiptScope(): string | null {
+    // Signaling can rotate peer-session IDs and the resume token while both seats stay the same.
+    return this.slotId && this.remoteSlotId ? JSON.stringify([this.slotId, this.remoteSlotId]) : null;
+  }
+
+  private loadReadReceipts(scope: string): void {
+    if (this.readReceiptScope === scope) return;
+    this.readReceiptScope = scope;
+    this.readReceiptIds.clear();
+    try {
+      const stored = window.sessionStorage.getItem(readReceiptStorageKey(this.roomId));
+      if (!stored) return;
+      const saved = JSON.parse(stored) as { scope?: unknown; ids?: unknown } | null;
+      if (saved?.scope !== scope || !Array.isArray(saved.ids)) return;
+      for (const id of saved.ids.slice(-CHAT_READ_RECEIPT_LIMIT)) {
+        if (typeof id === "string" && id.length > 0 && id.length <= 128) this.readReceiptIds.add(id);
+      }
+    } catch {
+      // Storage is optional; the current connection can still replay receipts from memory.
+    }
+  }
+
   markChatMessageRead(id: string): boolean {
-    if (!id || id.length > 128) return false;
-    // Remember the receipt even when the channel is closed: the flush on the
-    // next control-channel open is the delivery guarantee, not this send.
-    if (!this.readReceiptSet.has(id)) {
-      this.readReceiptSet.add(id);
-      this.readReceiptIds.push(id);
-      const overflow = this.readReceiptIds.length - 512;
-      if (overflow > 0) for (const evicted of this.readReceiptIds.splice(0, overflow)) this.readReceiptSet.delete(evicted);
+    const scope = this.chatReceiptScope();
+    if (this.closed || this.suspended || !scope || this.receivedChatScopes.get(id) !== scope) return false;
+    this.loadReadReceipts(scope);
+    if (!this.readReceiptIds.has(id)) {
+      this.readReceiptIds.add(id);
+      if (this.readReceiptIds.size > CHAT_READ_RECEIPT_LIMIT) {
+        const oldest = this.readReceiptIds.values().next();
+        if (!oldest.done) this.readReceiptIds.delete(oldest.value);
+      }
+      // Persist before sending: the channel can accept the send and still lose it on teardown.
+      try {
+        window.sessionStorage.setItem(readReceiptStorageKey(this.roomId), JSON.stringify({ scope, ids: [...this.readReceiptIds] }));
+      } catch {
+        // Keep the receipt in memory when storage is unavailable.
+      }
     }
     return this.sendOnChannel("control", JSON.stringify({ id, type: "chat-read" satisfies ChatReceiptMessage["type"] }));
   }
+
   private flushReadReceipts(): void {
+    const scope = this.chatReceiptScope();
+    if (!scope) return;
+    this.loadReadReceipts(scope);
     for (const id of this.readReceiptIds) {
       this.sendOnChannel("control", JSON.stringify({ id, type: "chat-read" satisfies ChatReceiptMessage["type"] }));
     }

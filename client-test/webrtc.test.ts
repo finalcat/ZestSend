@@ -138,10 +138,10 @@ function acceptRestart(epoch: number, localSession: string, initiator = false) {
   return socket;
 }
 
-function start(initiator = false) {
+function start(initiator = false, roomId = "room") {
   const onError = vi.fn();
   const onMessage = vi.fn();
-  const session = new NativeWebRTCSession("room", vi.fn(), vi.fn(), onError, vi.fn(), vi.fn(), vi.fn(), onMessage, vi.fn(), vi.fn(), vi.fn());
+  const session = new NativeWebRTCSession(roomId, vi.fn(), vi.fn(), onError, vi.fn(), vi.fn(), vi.fn(), onMessage, vi.fn(), vi.fn(), vi.fn());
   sessions.push(session);
   session.connect();
   const socket = FakeSocket.instances.at(-1)!;
@@ -202,6 +202,10 @@ function openChannel(peer: FakePeer, name: string): FakeChannel {
   channel.readyState = "open";
   channel.onopen?.();
   return channel;
+}
+
+function receiveChat(channel: FakeChannel, id: string): void {
+  channel.onmessage?.({ data: JSON.stringify({ type: "chat", id, text: "Hello" }) });
 }
 
 function replyMessage(withImage = false): RichChatMessage {
@@ -271,7 +275,8 @@ describe("reply capability compatibility", () => {
     const { session } = start(true);
     const peer = FakePeer.instances[0];
     const control = openChannel(peer, "control");
-    openChannel(peer, "interactive");
+    const interactive = openChannel(peer, "interactive");
+    receiveChat(interactive, "msg-1");
     expect(session.markChatMessageRead("msg-1")).toBe(true);
     expect(control.send).toHaveBeenCalledWith(JSON.stringify({ id: "msg-1", type: "chat-read" }));
     // Relayed links can tear the SCTP transport right after a send that
@@ -279,6 +284,7 @@ describe("reply capability compatibility", () => {
     // replay every recorded read; receipts queued while the channel was down
     // ride along instead of being stranded.
     control.readyState = "closed";
+    receiveChat(interactive, "msg-2");
     expect(session.markChatMessageRead("msg-2")).toBe(false);
     control.readyState = "open";
     control.onopen?.();
@@ -293,11 +299,16 @@ describe("reply capability compatibility", () => {
     const { session } = start(true);
     const peer = FakePeer.instances[0];
     const control = openChannel(peer, "control");
-    openChannel(peer, "interactive");
+    const interactive = openChannel(peer, "interactive");
+    receiveChat(interactive, "msg-1");
     session.markChatMessageRead("msg-1");
     session.markChatMessageRead("msg-1");
     control.readyState = "closed";
-    for (let index = 0; index < 600; index += 1) session.markChatMessageRead(`bulk-${index}`);
+    for (let index = 0; index < 600; index += 1) {
+      const id = `bulk-${index}`;
+      receiveChat(interactive, id);
+      session.markChatMessageRead(id);
+    }
     control.readyState = "open";
     control.onopen?.();
     const replayed = control.send.mock.calls
@@ -309,6 +320,42 @@ describe("reply capability compatibility", () => {
     expect(replayed.filter((id) => id === "msg-1")).toHaveLength(2);
     expect(replayed).toHaveLength(514);
     expect(replayed[2]).toBe("bulk-88");
+  });
+
+  it("restores a read receipt in a new document with the same room seats", () => {
+    const { session } = start(true);
+    const peer = FakePeer.instances.at(-1)!;
+    openChannel(peer, "control");
+    receiveChat(openChannel(peer, "interactive"), "before-refresh");
+    expect(session.markChatMessageRead("before-refresh")).toBe(true);
+    session.suspend();
+
+    const refreshed = start(true);
+    const control = openChannel(FakePeer.instances.at(-1)!, "control");
+    expect(control.send).toHaveBeenCalledWith(JSON.stringify({ id: "before-refresh", type: "chat-read" }));
+    expect(refreshed.onMessage).not.toHaveBeenCalled();
+
+    start(true, "other-room");
+    const otherRoomControl = openChannel(FakePeer.instances.at(-1)!, "control");
+    expect(otherRoomControl.send).not.toHaveBeenCalledWith(JSON.stringify({ id: "before-refresh", type: "chat-read" }));
+  });
+
+  it("does not replay receipts or mark old messages read for a replacement seat", () => {
+    const { session, socket } = start(true);
+    const peer = FakePeer.instances.at(-1)!;
+    openChannel(peer, "control");
+    const interactive = openChannel(peer, "interactive");
+    receiveChat(interactive, "read-by-old-peer");
+    receiveChat(interactive, "unread-from-old-peer");
+    expect(session.markChatMessageRead("read-by-old-peer")).toBe(true);
+
+    socket.receive({ type: "negotiate", epoch: 2, slotId: "replacement", peerSessionId: "replacement-session", offererSlotId: "local" });
+    const replacement = FakePeer.instances.at(-1)!;
+    expect(replacement).not.toBe(peer);
+    const control = openChannel(replacement, "control");
+    expect(control.send).not.toHaveBeenCalledWith(JSON.stringify({ id: "read-by-old-peer", type: "chat-read" }));
+    expect(session.markChatMessageRead("unread-from-old-peer")).toBe(false);
+    expect(control.send).not.toHaveBeenCalledWith(JSON.stringify({ id: "unread-from-old-peer", type: "chat-read" }));
   });
 
   it("ignores old channel callbacks and deadlines after peer replacement or suspend", async () => {
